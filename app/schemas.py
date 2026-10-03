@@ -38,6 +38,11 @@ class ReadingIn(BaseModel):
     id: str = Field(min_length=1, max_length=200, description="读数 ID，幂等键")
     ts: datetime = Field(description="采样时刻，ISO 8601；缺省时区按 UTC 处理")
     lux: float = Field(ge=0, description="照度（lux）")
+    source_id: str | None = Field(
+        default=None, min_length=1, max_length=200,
+        description="来源标识（传感器/采集器）；缺省表示未声明来源，"
+                    "同一时刻不同来源的读数全部留存，由来源优先级版本仲裁权威值",
+    )
 
     @field_validator("ts")
     @classmethod
@@ -62,6 +67,10 @@ class ReceiptReadingOut(BaseModel):
     id: str
     ts: str
     lux: float
+    source_id: str | None = Field(
+        default=None,
+        description="上报时声明的来源标识；未声明来源的旧式上报不出现该键（收据中为 null）",
+    )
 
 
 class ReceiptRequestOut(BaseModel):
@@ -196,6 +205,9 @@ class ReadingOut(BaseModel):
     ts: str
     lux: float
     received_at: str
+    source_id: str | None = Field(
+        default=None, description="上报时声明的来源标识；未声明来源为 null",
+    )
 
 
 class ReadingListOut(BaseModel):
@@ -286,6 +298,101 @@ class DoseResponse(BaseModel):
     )
 
 
+# ---------- 多来源读数仲裁（来源优先级版本 + 权威时间线） ----------
+
+class SourcePriorityVersionIn(BaseModel):
+    """发布一版来源优先级配置（追加式，版本只增不改）。"""
+
+    effective_at: datetime = Field(
+        description="生效时刻，ISO 8601；缺省时区按 UTC 处理。"
+                    "对采样时刻 t 仲裁时取 effective_at <= t 的最新版本",
+    )
+    priorities: list[Annotated[str, Field(min_length=1, max_length=200)]] = Field(
+        max_length=1000,
+        description="来源标识按优先级从高到低排列；未列入的来源（含未声明来源）并列最低；"
+                    "空列表表示全部来源平权",
+    )
+    expected_version: int = Field(
+        ge=0,
+        description="期望的当前最新版本号（尚无版本时为 0）；与服务器不一致返回 409",
+    )
+
+    @field_validator("effective_at")
+    @classmethod
+    def _aware(cls, v: datetime) -> datetime:
+        return ensure_aware(v)
+
+    @model_validator(mode="after")
+    def _unique_priorities(self) -> SourcePriorityVersionIn:
+        if len(set(self.priorities)) != len(self.priorities):
+            raise ValueError("优先级列表中的来源标识重复")
+        return self
+
+
+class SourcePriorityVersionEntry(BaseModel):
+    """一版已发布的来源优先级配置。"""
+
+    version: int
+    effective_at: str = Field(description="生效时刻（UTC，ISO 8601，Z 结尾）")
+    priorities: list[str]
+    created_at: str
+
+
+class SourcePriorityVersionOut(SourcePriorityVersionEntry):
+    """PUT 发布成功后的新版本。"""
+
+    requested_id: str = Field(description="请求中使用的展品 ID（可能是别名）")
+    canonical_id: str = Field(description="配置所属的规范档案 ID")
+
+
+class SourcePriorityOut(BaseModel):
+    """展品当前的来源优先级配置（全部版本）。"""
+
+    requested_id: str = Field(description="请求中使用的展品 ID（可能是别名）")
+    canonical_id: str = Field(description="配置所属的规范档案 ID")
+    current_version: int = Field(description="当前最新版本号；尚无版本时为 0")
+    versions: list[SourcePriorityVersionEntry]
+
+
+class TimelineEntryOut(BaseModel):
+    """权威时间线上的一个采样时刻：仲裁成功（ok）或保持冲突（conflict）。"""
+
+    ts: str = Field(description="采样时刻（UTC，ISO 8601，Z 结尾）")
+    status: Literal["ok", "conflict"]
+    lux: float | None = Field(
+        default=None, description="status=ok：该时刻的权威照度（lux）",
+    )
+    reading_ids: list[str] = Field(
+        description="status=ok：胜出集合的读数 ID；status=conflict：并列最高优先级的读数 ID",
+    )
+    source_ids: list[str | None] = Field(
+        description="与 reading_ids 一一对应的来源标识（未声明来源为 null）",
+    )
+    lux_span: float | None = Field(
+        default=None, description="status=conflict：并列最高优先级读数的照度跨度",
+    )
+    priority_version: int | None = Field(
+        default=None,
+        description="该时刻生效的优先级版本号；无生效版本（平权仲裁）为 null",
+    )
+
+
+class TimelineOut(BaseModel):
+    """权威时间线查询结果。"""
+
+    requested_id: str = Field(description="请求中使用的展品 ID（可能是别名）")
+    canonical_id: str = Field(description="时间线所属的规范档案 ID")
+    start: str
+    end: str
+    arbitrated: bool = Field(
+        description="展品是否已配置来源优先级版本（false 时全部读数平权，与旧口径一致）",
+    )
+    entries: list[TimelineEntryOut] = Field(
+        description="窗口内（含端点）的仲裁结果，按采样时刻升序；"
+                    "status=conflict 的时刻不进入剂量与诊断时间线",
+    )
+
+
 # ---------- 重复档案归并 ----------
 
 class MergePreviewRequest(BaseModel):
@@ -323,6 +430,11 @@ class MergePreviewOut(BaseModel):
     auto_duplicate_count: int = Field(description="时间、照度一致、提交时自动去重的条数")
     conflict_count: int = Field(description="内容不同、必须逐条裁决的碰撞条数")
     source_only_count: int = Field(description="仅来源存在、将随档案搬迁的读数条数")
+    source_priority_conflict: bool = Field(
+        default=False,
+        description="双方都已配置来源优先级版本且内容不一致：归并提交将被拒绝（409），"
+                    "冲突不会静默覆盖；仅一方配置或双方一致时自动合并",
+    )
     ready_to_commit: bool = Field(description="是否不存在待裁决冲突（true 才可提交）")
 
 

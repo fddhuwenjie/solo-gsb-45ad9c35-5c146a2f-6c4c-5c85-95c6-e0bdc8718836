@@ -55,7 +55,9 @@ def _inserted_targets(payload_json: str) -> list[dict]:
     for r in content["request"]["readings"]:
         if r["id"] in inserted_ids and r["id"] not in seen:
             seen.add(r["id"])
-            targets.append({"id": r["id"], "ts": r["ts"], "lux": r["lux"]})
+            # 旧收据没有 source_id 键：get 返回 None，对应未声明来源的读数
+            targets.append({"id": r["id"], "ts": r["ts"], "lux": r["lux"],
+                            "source_id": r.get("source_id")})
     return targets
 
 
@@ -163,7 +165,7 @@ def correct_receipt(
         voided: list[VoidedReadingOut] = []
         for t in targets:
             row = conn.execute(
-                "SELECT ts, lux, voided_at FROM readings "
+                "SELECT ts, lux, source_id, voided_at FROM readings "
                 "WHERE exhibit_id = ? AND reading_id = ?",
                 (canonical_id, t["id"]),
             ).fetchone()
@@ -177,7 +179,12 @@ def correct_receipt(
             if row["voided_at"] is not None:
                 problems.append(f"{t['id']}：读数已被作废")
                 continue
-            if row["ts"] != _parse_iso_epoch(t["ts"]) or row["lux"] != t["lux"]:
+            # 来源标识同样是读数内容：收据记录的来源与当前不一致即视为归属已变化
+            # （旧收据没有 source_id 键，_inserted_targets 以 None 兜底）。
+            cols = row.keys()
+            row_source = row["source_id"] if "source_id" in cols else None
+            if (row["ts"] != _parse_iso_epoch(t["ts"]) or row["lux"] != t["lux"]
+                    or row_source != t["source_id"]):
                 problems.append(f"{t['id']}：读数内容与收据记录不一致（读数归属已变化）")
                 continue
             voided.append(VoidedReadingOut(id=t["id"], ts=t["ts"], lux=t["lux"]))

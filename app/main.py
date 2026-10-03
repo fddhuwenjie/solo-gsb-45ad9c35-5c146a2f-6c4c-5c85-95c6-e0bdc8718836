@@ -1,4 +1,4 @@
-"""FastAPI 应用入口：展品登记、读数上报（幂等 + 存证收据）、剂量时段查询、展陈开放日历、重复档案归并、RFID 盘点对账。"""
+"""FastAPI 应用入口：展品登记、读数上报（幂等 + 存证收据）、剂量时段查询、展陈开放日历、重复档案归并、RFID 盘点对账、多来源读数仲裁。"""
 from __future__ import annotations
 
 import json
@@ -12,6 +12,13 @@ from typing import Literal
 from fastapi import Depends, FastAPI, HTTPException, Query, Response
 from fastapi.responses import FileResponse
 
+from .arbitration import (
+    ArbitrationPoint,
+    arbitrate,
+    diagnosis_feed,
+    first_point_after,
+    load_priority_versions,
+)
 from .calendar import (
     CalendarConfig,
     delete_calendar,
@@ -71,6 +78,12 @@ from .schemas import (
     SnapshotListOut,
     SnapshotOut,
     SnapshotVerifyOut,
+    SourcePriorityOut,
+    SourcePriorityVersionEntry,
+    SourcePriorityVersionIn,
+    SourcePriorityVersionOut,
+    TimelineEntryOut,
+    TimelineOut,
     ensure_aware,
     format_local_time,
     parse_local_time,
@@ -95,11 +108,16 @@ async def lifespan(_: FastAPI) -> Iterator[None]:
 
 app = FastAPI(
     title="馆藏展品光照剂量核算 API",
-    version="1.8.0",
+    version="1.9.0",
     description="登记展品光照上限，接收乱序/补传照度读数，按梯形法累计 lux·h，缺测段不插值；"
                 "支持展陈开放日历（IANA 时区 + 每周时段 + 日期例外），剂量可按开放时段裁剪核算；"
                 "支持重复展品档案预演归并，来源 ID 归并后成为目标 ID 的永久别名；"
                 "支持基于完整时间线的照度采集质量诊断（gap / jump / stuck / timestamp_conflict）；"
+                "支持多来源读数仲裁：读数可带 source_id（同时刻不同来源全部留存），"
+                "按带生效时刻的来源优先级版本选出权威值（最高级并列且照度不同的时刻保持冲突，"
+                "不进入剂量或诊断时间线），配置更新须携带 expected_version（过期 409），"
+                "调整只从生效时刻起影响重算、不改写历史收据与原始读数，"
+                "归并合并来源配置且冲突不静默覆盖，提供权威时间线查询；"
                 "支持 RFID 馆藏盘点对账（固定窗口内按区域保留最高 RSSI、以最后一个有事件窗口"
                 "定位、信号差不足阈值记为位置不明；轮次与规范化请求摘要绑定，重放原结果、"
                 "冲突请求 409、并发只固化一份结果；对账不改读数与收据链）；"
@@ -291,7 +309,8 @@ def remove_calendar(exhibit_id: str, conn: sqlite3.Connection = Depends(get_conn
 
 # ---------- 读数上报（幂等 + 存证收据） ----------
 
-@app.post("/exhibits/{exhibit_id}/readings", response_model=IngestResponse, tags=["readings"])
+@app.post("/exhibits/{exhibit_id}/readings", response_model=IngestResponse,
+          response_model_exclude_unset=True, tags=["readings"])
 def ingest_readings(
     exhibit_id: str,
     batch: ReadingBatch,
@@ -301,8 +320,11 @@ def ingest_readings(
 
     请求 ID 若是已归并档案的别名，自动解析到规范档案。
 
-    读数 ID 幂等：同 ID 同数据重复上报记为 duplicate，不重复计入；
-    同 ID 不同数据记为 conflict，拒绝写入并在结果中标出。
+    读数 ID 幂等：同 ID 同数据（采样时刻、照度、来源标识一致）重复上报记为
+    duplicate，不重复计入；同 ID 不同数据记为 conflict，拒绝写入并在结果中
+    标出。每条读数可带 ``source_id`` 声明来源：同一采样时刻不同来源的读数
+    以不同读数 ID 全部留存，由来源优先级版本在查询时仲裁权威值；
+    不带 ``source_id`` 的旧式请求行为完全不变。
 
     存证：收据按稳定规范序列化记录请求内容与逐条结果，并以 SHA-256
     链哈希衔接上一张收据；并发上报在写锁内分配序号，形成唯一连续顺序；
@@ -321,17 +343,21 @@ def ingest_readings(
             ts = r.ts.timestamp()
             try:
                 conn.execute(
-                    "INSERT INTO readings (exhibit_id, reading_id, ts, lux) VALUES (?, ?, ?, ?)",
-                    (canonical_id, r.id, ts, r.lux),
+                    "INSERT INTO readings (exhibit_id, reading_id, ts, lux, source_id) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (canonical_id, r.id, ts, r.lux, r.source_id),
                 )
                 status = "inserted"
                 inserted += 1
             except sqlite3.IntegrityError:
                 existing = conn.execute(
-                    "SELECT ts, lux FROM readings WHERE exhibit_id = ? AND reading_id = ?",
+                    "SELECT ts, lux, source_id FROM readings "
+                    "WHERE exhibit_id = ? AND reading_id = ?",
                     (canonical_id, r.id),
                 ).fetchone()
-                if existing is not None and existing["ts"] == ts and existing["lux"] == r.lux:
+                if (existing is not None and existing["ts"] == ts
+                        and existing["lux"] == r.lux
+                        and existing["source_id"] == r.source_id):
                     status = "duplicate"
                     duplicates += 1
                 else:
@@ -339,13 +365,17 @@ def ingest_readings(
                     conflicts += 1
             results.append(ReadingResult(id=r.id, status=status))
 
-        # 收据与读数同一事务落库：任一失败整体回滚，失败事务不留收据
+        # 收据与读数同一事务落库：任一失败整体回滚，失败事务不留收据。
+        # 来源标识只在上报时声明了才记入收据（旧式请求的收据内容保持原样）。
         receipt_row = mint_receipt(
             conn,
             chain_id=canonical_id,
             requested_id=exhibit_id,
             readings=[
-                {"id": r.id, "ts": request_ts_iso(r.ts), "lux": r.lux}
+                {
+                    "id": r.id, "ts": request_ts_iso(r.ts), "lux": r.lux,
+                    **({"source_id": r.source_id} if r.source_id is not None else {}),
+                }
                 for r in batch.readings
             ],
             results=[{"id": x.id, "status": x.status} for x in results],
@@ -395,7 +425,7 @@ def list_readings(
         canonical_id=canonical_id,
         readings=[
             ReadingOut(id=r["reading_id"], ts=to_iso(r["ts"]), lux=r["lux"],
-                       received_at=r["received_at"])
+                       received_at=r["received_at"], source_id=r["source_id"])
             for r in rows
         ],
     )
@@ -430,7 +460,8 @@ def _chain_verify_out(chain_id: str, verdict: ChainVerification) -> ChainVerifyO
     )
 
 
-@app.get("/exhibits/{exhibit_id}/receipts", response_model=ReceiptListOut, tags=["receipts"])
+@app.get("/exhibits/{exhibit_id}/receipts", response_model=ReceiptListOut,
+         response_model_exclude_unset=True, tags=["receipts"])
 def list_receipts(
     exhibit_id: str,
     limit: int = Query(default=1000, ge=1, le=100000),
@@ -489,7 +520,8 @@ def void_ingest_batch(
     return correct_receipt(conn, exhibit_id, payload)
 
 
-@app.get("/exhibits/{exhibit_id}/receipts/{seq}", response_model=ReceiptOut, tags=["receipts"])
+@app.get("/exhibits/{exhibit_id}/receipts/{seq}", response_model=ReceiptOut,
+         response_model_exclude_unset=True, tags=["receipts"])
 def get_receipt(
     exhibit_id: str,
     seq: int,
@@ -507,7 +539,8 @@ def get_receipt(
     return receipt_out(row, void_map)
 
 
-@app.get("/receipts/chains/{chain_id}", response_model=ChainReceiptsOut, tags=["receipts"])
+@app.get("/receipts/chains/{chain_id}", response_model=ChainReceiptsOut,
+         response_model_exclude_unset=True, tags=["receipts"])
 def list_chain_receipts(
     chain_id: str,
     limit: int = Query(default=1000, ge=1, le=100000),
@@ -556,6 +589,9 @@ def diagnose_readings(
     - 同时刻照度相同的多条读数先**合并**为一个时间点（读数 ID 全部保留）；
       同时刻出现**不同照度**则产生 ``timestamp_conflict``，该时刻不落点，
       并从两侧中断连续链；
+    - 已配置来源优先级版本时，诊断基于**权威时间线**：每个采样时刻先按
+      生效版本仲裁（最高优先级来源胜出；最高级并列且照度不同的时刻保持
+      冲突、不落点），被仲裁丢弃的低优先级读数不进入诊断时间线；
     - 对无歧义读数：相邻间隔**超过**展品 ``max_interval_seconds`` 记为
       ``gap``；间隔合规但变化速率 ``|Δlux|/Δt`` 超过
       ``max_rate_lux_per_second`` 记为 ``jump``；相邻照度差均不超过
@@ -575,14 +611,24 @@ def diagnose_readings(
     if end_s <= start_s:
         raise HTTPException(status_code=422, detail="end 必须晚于 start")
 
-    # 完整时间线：诊断事件必须在全部已存（未作废）读数上形成，不能只取窗口内数据
+    # 完整时间线：诊断事件必须在全部已存（未作废）读数上形成，不能只取窗口内数据。
+    # 配置了来源优先级版本时先逐时刻仲裁，诊断在权威时间线上进行。
     rows = conn.execute(
-        "SELECT reading_id, ts, lux FROM readings "
+        "SELECT reading_id, ts, lux, source_id FROM readings "
         "WHERE exhibit_id = ? AND voided_at IS NULL ORDER BY ts, reading_id",
         (canonical_id,),
     ).fetchall()
+    versions = load_priority_versions(conn, canonical_id)
+    if versions:
+        points, arb_conflicts = arbitrate(
+            [(r["reading_id"], r["ts"], r["lux"], r["source_id"]) for r in rows],
+            versions,
+        )
+        feed = diagnosis_feed(points, arb_conflicts)
+    else:
+        feed = [(r["reading_id"], r["ts"], r["lux"]) for r in rows]
     events = build_events(
-        [(r["reading_id"], r["ts"], r["lux"]) for r in rows],
+        feed,
         max_interval_s=exhibit["max_interval_seconds"],
         max_rate_lux_per_s=payload.max_rate_lux_per_second,
         stuck_tol_lux=payload.stuck_tolerance_lux,
@@ -643,6 +689,9 @@ def query_dose(
       全历史累计计算，首次越线时刻不因缩窄窗口而改变；
     - 剂量在查询时基于全部已存读数实时重算，补传读数立即生效；
     - 请求 ID 若是已归并档案的别名，自动解析到规范档案；
+    - 已配置来源优先级版本时，剂量基于**权威时间线**：每个采样时刻按生效
+      版本仲裁出权威值（最高级并列且照度不同的时刻保持冲突、不进入剂量
+      时间线），``reading_count`` 为窗口内权威点数量；未配置时保持原有口径；
     - ``calendar=display`` 时仅在开放区间内裁剪梯形积分：窗口内闭馆时长
       单列 closed_seconds，covered_seconds、unknown_seconds、closed_seconds
       之和等于窗口时长；剩余额度与首次越线也按截至窗口末的开放历史计算；
@@ -659,19 +708,37 @@ def query_dose(
     # 1) 截至 end 的全部历史读数——remaining/exceeded/first_exceeded_at 按全历史累计；
     # 2) end 之后最近一条读数——窗口末端可向其线性裁剪。
     # 窗口起点之前的历史读数本身就在 1) 中，窗口起点处同样可线性裁剪。
-    all_rows = conn.execute(
-        "SELECT ts, lux FROM readings WHERE exhibit_id = ? AND ts <= ? "
-        "AND voided_at IS NULL ORDER BY ts ASC",
-        (canonical_id, end_s),
-    ).fetchall()
-    after = conn.execute(
-        "SELECT ts, lux FROM readings WHERE exhibit_id = ? AND ts > ? "
-        "AND voided_at IS NULL ORDER BY ts ASC LIMIT 1",
-        (canonical_id, end_s),
-    ).fetchall()
-    readings = [(r["ts"], r["lux"]) for r in all_rows]
-    if after:
-        readings.append((after[0]["ts"], after[0]["lux"]))
+    # 配置了来源优先级版本时，读数先逐时刻仲裁为权威时间线（冲突时刻不进入）。
+    versions = load_priority_versions(conn, canonical_id)
+    if versions:
+        all_rows = conn.execute(
+            "SELECT reading_id, ts, lux, source_id FROM readings "
+            "WHERE exhibit_id = ? AND ts <= ? AND voided_at IS NULL "
+            "ORDER BY ts, reading_id",
+            (canonical_id, end_s),
+        ).fetchall()
+        points, _arb_conflicts = arbitrate(
+            [(r["reading_id"], r["ts"], r["lux"], r["source_id"]) for r in all_rows],
+            versions,
+        )
+        readings = [(p.ts, p.lux) for p in points]
+        after_point = first_point_after(conn, canonical_id, versions, end_s)
+        if after_point is not None:
+            readings.append((after_point.ts, after_point.lux))
+    else:
+        all_rows = conn.execute(
+            "SELECT ts, lux FROM readings WHERE exhibit_id = ? AND ts <= ? "
+            "AND voided_at IS NULL ORDER BY ts ASC",
+            (canonical_id, end_s),
+        ).fetchall()
+        after = conn.execute(
+            "SELECT ts, lux FROM readings WHERE exhibit_id = ? AND ts > ? "
+            "AND voided_at IS NULL ORDER BY ts ASC LIMIT 1",
+            (canonical_id, end_s),
+        ).fetchall()
+        readings = [(r["ts"], r["lux"]) for r in all_rows]
+        if after:
+            readings.append((after[0]["ts"], after[0]["lux"]))
 
     intervals: list[tuple[float, float]] | None = None
     if calendar == "display":
@@ -711,6 +778,166 @@ def query_dose(
     if result.closed_seconds is not None:
         response.closed_seconds = round6(result.closed_seconds)
     return response
+
+
+# ---------- 多来源读数仲裁（来源优先级版本 + 权威时间线） ----------
+
+def _priority_version_entry(v) -> SourcePriorityVersionEntry:
+    return SourcePriorityVersionEntry(
+        version=v.version,
+        effective_at=to_iso(v.effective_at),
+        priorities=list(v.priorities),
+        created_at=v.created_at,
+    )
+
+
+@app.put("/exhibits/{exhibit_id}/source-priority",
+         response_model=SourcePriorityVersionOut, status_code=201,
+         tags=["source-priority"])
+def put_source_priority(
+    exhibit_id: str,
+    payload: SourcePriorityVersionIn,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> SourcePriorityVersionOut:
+    """发布一版来源优先级配置（追加式，版本只增不改）。
+
+    - ``priorities`` 按优先级从高到低列出来源标识；未列入的来源（含未声明
+      来源的旧式读数）并列最低；空列表表示全部来源平权；
+    - ``effective_at`` 为生效时刻：对采样时刻 t 仲裁时取 ``effective_at <= t``
+      的最新版本，因此调整优先级**只从生效时刻起影响重算**，历史收据与
+      原始读数行绝不改写；
+    - 必须携带 ``expected_version``（当前最新版本号，尚无版本时为 0）：
+      与服务器不一致返回 **409**（配置已过期，需重新读取后重试）；
+      写事务串行化保证并发更新只有一个成功；
+    - 请求 ID 若是已归并档案的别名，自动解析到规范档案。
+    """
+    exhibit = get_canonical_or_404(conn, exhibit_id)
+    canonical_id = exhibit["id"]
+    effective_s = ensure_aware(payload.effective_at).timestamp()
+
+    # BEGIN IMMEDIATE 串行化并发配置更新：版本检查与插入在同一写锁内完成。
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute(
+            "SELECT MAX(version) AS v FROM source_priority_versions WHERE exhibit_id = ?",
+            (canonical_id,),
+        ).fetchone()
+        current = row["v"] if row["v"] is not None else 0
+        if payload.expected_version != current:
+            raise HTTPException(
+                status_code=409,
+                detail=f"来源优先级配置已过期：当前最新版本为 {current}，"
+                       f"请求携带 expected_version={payload.expected_version}，"
+                       "请重新读取配置后重试",
+            )
+        new_version = current + 1
+        conn.execute(
+            "INSERT INTO source_priority_versions "
+            "(exhibit_id, version, effective_at, priorities) VALUES (?, ?, ?, ?)",
+            (canonical_id, new_version, effective_s,
+             json.dumps(list(payload.priorities), ensure_ascii=False)),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+    versions = load_priority_versions(conn, canonical_id)
+    created = versions[-1]
+    return SourcePriorityVersionOut(
+        requested_id=exhibit_id,
+        canonical_id=canonical_id,
+        **_priority_version_entry(created).model_dump(),
+    )
+
+
+@app.get("/exhibits/{exhibit_id}/source-priority",
+         response_model=SourcePriorityOut, tags=["source-priority"])
+def get_source_priority(
+    exhibit_id: str,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> SourcePriorityOut:
+    """查询展品的来源优先级配置（全部版本，按版本号升序）；别名自动解析。"""
+    exhibit = get_canonical_or_404(conn, exhibit_id)
+    canonical_id = exhibit["id"]
+    versions = load_priority_versions(conn, canonical_id)
+    return SourcePriorityOut(
+        requested_id=exhibit_id,
+        canonical_id=canonical_id,
+        current_version=versions[-1].version if versions else 0,
+        versions=[_priority_version_entry(v) for v in versions],
+    )
+
+
+@app.get("/exhibits/{exhibit_id}/timeline", response_model=TimelineOut,
+         response_model_exclude_unset=True, tags=["source-priority"])
+def get_authoritative_timeline(
+    exhibit_id: str,
+    start: datetime = Query(..., description="窗口起点（含），ISO 8601"),
+    end: datetime = Query(..., description="窗口终点（含），ISO 8601"),
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> TimelineOut:
+    """权威时间线查询：窗口内每个采样时刻的仲裁结果。
+
+    - 已配置来源优先级版本时，每个采样时刻按生效版本仲裁：最高优先级来源
+      胜出（``status=ok`` 并给出权威照度）；最高级并列且照度不同的时刻
+      **保持冲突**（``status=conflict``），不进入剂量与诊断时间线；
+    - 未配置任何版本时全部读数平权：同时刻同值合并、异值冲突，与旧口径一致；
+    - 仲裁在查询时实时进行，优先级版本调整只从生效时刻起影响结果，
+      原始读数与历史收据不改写；别名自动解析到规范档案。
+    """
+    exhibit = get_canonical_or_404(conn, exhibit_id)
+    canonical_id = exhibit["id"]
+    start_s = ensure_aware(start).timestamp()
+    end_s = ensure_aware(end).timestamp()
+    if end_s <= start_s:
+        raise HTTPException(status_code=422, detail="end 必须晚于 start")
+
+    rows = conn.execute(
+        "SELECT reading_id, ts, lux, source_id FROM readings "
+        "WHERE exhibit_id = ? AND voided_at IS NULL AND ts >= ? AND ts <= ? "
+        "ORDER BY ts, reading_id",
+        (canonical_id, start_s, end_s),
+    ).fetchall()
+    versions = load_priority_versions(conn, canonical_id)
+    points, arb_conflicts = arbitrate(
+        [(r["reading_id"], r["ts"], r["lux"], r["source_id"]) for r in rows],
+        versions,
+    )
+
+    entries: list[TimelineEntryOut] = []
+    # 按浮点时刻归并排序（ISO 字符串混有小数秒时字典序不等于时序）
+    for ts, item in sorted(
+        [(p.ts, p) for p in points] + [(c.ts, c) for c in arb_conflicts],
+        key=lambda x: x[0],
+    ):
+        if isinstance(item, ArbitrationPoint):
+            entries.append(TimelineEntryOut(
+                ts=to_iso(item.ts),
+                status="ok",
+                lux=item.lux,
+                reading_ids=[m.reading_id for m in item.members],
+                source_ids=[m.source_id for m in item.members],
+                priority_version=item.version,
+            ))
+        else:
+            entries.append(TimelineEntryOut(
+                ts=to_iso(item.ts),
+                status="conflict",
+                reading_ids=[m.reading_id for m in item.members],
+                source_ids=[m.source_id for m in item.members],
+                lux_span=round6(item.lux_span),
+                priority_version=item.version,
+            ))
+
+    return TimelineOut(
+        requested_id=exhibit_id,
+        canonical_id=canonical_id,
+        start=to_iso(start_s),
+        end=to_iso(end_s),
+        arbitrated=bool(versions),
+        entries=entries,
+    )
 
 
 # ---------- 重复档案归并 ----------

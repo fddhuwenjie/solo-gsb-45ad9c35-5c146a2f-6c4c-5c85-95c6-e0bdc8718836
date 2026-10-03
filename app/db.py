@@ -18,6 +18,8 @@ CREATE TABLE IF NOT EXISTS exhibits (
 );
 
 -- 读数以 (exhibit_id, reading_id) 为主键，reading_id 即客户端幂等键。
+-- source_id 为可选的来源标识（传感器/采集器）；同一采样时刻不同来源的读数
+-- 以不同 reading_id 全部留存，由来源优先级版本在查询时仲裁出权威值。
 -- 批次更正只在 readings 行上置作废标记（软删除）：作废后读数立刻退出
 -- 剂量/诊断/列表口径，但行保留作为存证；voided_by 指向作废它的更正记录。
 CREATE TABLE IF NOT EXISTS readings (
@@ -25,6 +27,7 @@ CREATE TABLE IF NOT EXISTS readings (
     reading_id   TEXT NOT NULL,
     ts           REAL NOT NULL,           -- 采样时刻，Unix 秒（UTC）
     lux          REAL NOT NULL CHECK (lux >= 0),
+    source_id    TEXT,                    -- 来源标识；NULL 表示旧式上报（未声明来源）
     received_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     voided_at    TEXT,                    -- 作废时刻（UTC ISO）；NULL 表示读数仍生效
     voided_by    TEXT,                    -- 作废它的 reading_corrections.request_key
@@ -153,12 +156,29 @@ CREATE TABLE IF NOT EXISTS reading_corrections (
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_reading_corrections_receipt
 ON reading_corrections (chain_id, seq);
+
+-- 多来源读数仲裁：来源优先级版本。每版携带生效时刻 effective_at 与来源
+-- 优先级列表（JSON 数组，靠前优先级更高；未列入的来源并列最低）。
+-- 版本只增不改：配置更新必须携带 expected_version（当前最新版本号），
+-- 过期返回 409；对采样时刻 t 仲裁时取 effective_at <= t 的最新版本，
+-- 因此调整优先级只从生效时刻起影响重算，历史收据与原始读数不改写。
+-- 档案归并时双方配置按版本内容比对：一致或仅来源有才合并（搬迁），
+-- 双方都有且不一致则拒绝归并（冲突不静默覆盖）；随档案删除级联清除。
+CREATE TABLE IF NOT EXISTS source_priority_versions (
+    exhibit_id   TEXT NOT NULL REFERENCES exhibits(id) ON DELETE CASCADE,
+    version      INTEGER NOT NULL CHECK (version >= 1),
+    effective_at REAL NOT NULL,           -- 生效时刻，Unix 秒（UTC）
+    priorities   TEXT NOT NULL,           -- JSON 数组：source_id 按优先级从高到低
+    created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (exhibit_id, version)
+);
 """
 
-# 旧库（更正功能上线前创建）补列：幂等 ALTER，列已存在则跳过。
+# 旧库（更正/多来源功能上线前创建）补列：幂等 ALTER，列已存在则跳过。
 _LEGACY_MIGRATIONS = (
     "ALTER TABLE readings ADD COLUMN voided_at TEXT",
     "ALTER TABLE readings ADD COLUMN voided_by TEXT",
+    "ALTER TABLE readings ADD COLUMN source_id TEXT",
 )
 
 

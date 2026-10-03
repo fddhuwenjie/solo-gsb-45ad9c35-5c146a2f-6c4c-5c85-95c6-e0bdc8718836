@@ -13,6 +13,9 @@
 - 归并不触碰照度上报存证收据链：来源与目标的既有链原样保留、提交前
   分别校验（断链或内容不符即 409 拒绝归并），归并后的新上报继续接入
   目标原链，旧哈希绝不重写。
+- 来源优先级配置随归并合并：仅来源有才整体搬迁到目标；双方逐版本一致
+  保留目标的一份；双方都有且不一致 → 409 拒绝归并，冲突绝不静默覆盖。
+  配置指纹纳入预演版本令牌，预演后任一侧发布新版本同样使令牌失效。
 """
 from __future__ import annotations
 
@@ -24,6 +27,11 @@ from datetime import datetime, timezone
 
 from fastapi import HTTPException
 
+from .arbitration import (
+    load_priority_versions,
+    versions_equal,
+    versions_fingerprint,
+)
 from .receipts import load_chain, verify_chain_rows
 from .schemas import (
     MergeCollision,
@@ -40,13 +48,18 @@ def to_iso(epoch: float) -> str:
     return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _meta_hash(row: sqlite3.Row) -> str:
+def _meta_hash(conn: sqlite3.Connection, row: sqlite3.Row) -> str:
+    # 来源优先级配置同样属于档案元数据版本：预演后发布新版本（或配置被合并）
+    # 都会使令牌失效，归并提交 409。
     payload = {
         "id": row["id"],
         "name": row["name"],
         "dose_limit_luxh": float.hex(row["dose_limit_luxh"]),
         "max_interval_seconds": float.hex(row["max_interval_seconds"]),
         "created_at": row["created_at"],
+        "source_priority": versions_fingerprint(
+            load_priority_versions(conn, row["id"])
+        ),
     }
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
@@ -54,14 +67,15 @@ def _meta_hash(row: sqlite3.Row) -> str:
 
 
 def _readings_hash(rows: list[sqlite3.Row]) -> str:
-    # 作废标记同样是读数集合版本的一部分：预演后发生批次更正（作废）也使令牌失效。
-    # 旧库迁移前列可能缺失，用 row.keys() 兜底。
+    # 作废标记与来源标识同样是读数集合版本的一部分：预演后发生批次更正（作废）
+    # 或读数来源变化也使令牌失效。旧库迁移前列可能缺失，用 row.keys() 兜底。
     cols = rows[0].keys() if rows else ()
     payload = [
         (
             r["reading_id"], float.hex(r["ts"]), float.hex(r["lux"]),
             r["voided_at"] if "voided_at" in cols else None,
             r["voided_by"] if "voided_by" in cols else None,
+            r["source_id"] if "source_id" in cols else None,
         )
         for r in rows
     ]
@@ -123,6 +137,18 @@ def _meta_diff_field(field: str, source: object, target: object) -> MergeMetaDif
     return None
 
 
+def _versions_brief(versions: list) -> list[dict]:
+    """来源优先级版本的可读摘要（预演 metadata 差异用）。"""
+    return [
+        {
+            "version": v.version,
+            "effective_at": to_iso(v.effective_at),
+            "priorities": list(v.priorities),
+        }
+        for v in versions
+    ]
+
+
 def create_preview(conn: sqlite3.Connection, requested_source: str,
                    requested_target: str) -> MergePreviewOut:
     if requested_source == requested_target:
@@ -178,6 +204,21 @@ def create_preview(conn: sqlite3.Connection, requested_source: str,
         if diff is not None:
             metadata[field] = diff
 
+    # 来源优先级配置：双方都有且不一致时冲突不可静默覆盖（提交将 409）；
+    # 仅来源有才在提交时自动搬迁，双方一致则保留目标的一份。
+    src_versions = load_priority_versions(conn, source_id)
+    tgt_versions = load_priority_versions(conn, target_id)
+    priority_conflict = bool(
+        src_versions and tgt_versions and not versions_equal(src_versions, tgt_versions)
+    )
+    if src_versions or tgt_versions:
+        if not versions_equal(src_versions, tgt_versions):
+            metadata["source_priority"] = MergeMetaDiff(
+                field="source_priority",
+                source=_versions_brief(src_versions),
+                target=_versions_brief(tgt_versions),
+            )
+
     source_only = len(src_map) - len(collisions)
 
     token = uuid.uuid4().hex
@@ -188,7 +229,7 @@ def create_preview(conn: sqlite3.Connection, requested_source: str,
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             token, source_id, target_id,
-            _meta_hash(src), _meta_hash(tgt),
+            _meta_hash(conn, src), _meta_hash(conn, tgt),
             _readings_hash(list(src_rows)), _readings_hash(list(tgt_rows)),
             conflicts,
         ),
@@ -208,7 +249,8 @@ def create_preview(conn: sqlite3.Connection, requested_source: str,
         auto_duplicate_count=auto_dup,
         conflict_count=conflicts,
         source_only_count=source_only,
-        ready_to_commit=conflicts == 0,
+        source_priority_conflict=priority_conflict,
+        ready_to_commit=conflicts == 0 and not priority_conflict,
     )
 
 
@@ -220,6 +262,10 @@ class _PreviewChanged(Exception):
 
 class _ChainBroken(Exception):
     """来源或目标的存证收据链校验失败（断链/内容不符），归并必须 409 拒绝。"""
+
+
+class _PriorityConflict(Exception):
+    """双方来源优先级配置不一致，归并必须 409 拒绝（冲突不静默覆盖）。"""
 
 
 class _CommitValidation(Exception):
@@ -308,8 +354,8 @@ def commit_merge(conn: sqlite3.Connection, token: str,
             "SELECT * FROM readings WHERE exhibit_id = ?", (target_id,)
         ).fetchall()
         if (
-            _meta_hash(src) != preview["source_meta_hash"]
-            or _meta_hash(tgt) != preview["target_meta_hash"]
+            _meta_hash(conn, src) != preview["source_meta_hash"]
+            or _meta_hash(conn, tgt) != preview["target_meta_hash"]
             or _readings_hash(list(src_rows)) != preview["source_read_hash"]
             or _readings_hash(list(tgt_rows)) != preview["target_read_hash"]
         ):
@@ -325,6 +371,28 @@ def commit_merge(conn: sqlite3.Connection, token: str,
                 raise _ChainBroken(
                     f"档案 {cid} 的存证收据链校验失败：第 {failure.get('seq')} 张"
                     f"（{failure.get('reason')}），归并被拒绝"
+                )
+
+        # 来源优先级配置合并：仅来源有才整体搬迁到目标（版本号保持）；
+        # 双方一致保留目标的一份；双方都有且不一致 → 409 拒绝归并，
+        # 冲突绝不静默覆盖。来源档案删除时其版本随外键级联清除。
+        src_versions = load_priority_versions(conn, source_id)
+        tgt_versions = load_priority_versions(conn, target_id)
+        if src_versions and tgt_versions:
+            if not versions_equal(src_versions, tgt_versions):
+                raise _PriorityConflict(
+                    "来源与目标的来源优先级配置不一致（双方均已配置版本），"
+                    "归并被拒绝：配置冲突不会静默覆盖，请先把两边配置调整为一致"
+                    "或清空其中一方后重新预演"
+                )
+        elif src_versions:
+            for v in src_versions:
+                conn.execute(
+                    "INSERT INTO source_priority_versions "
+                    "(exhibit_id, version, effective_at, priorities, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (target_id, v.version, v.effective_at,
+                     json.dumps(v.priorities, ensure_ascii=False), v.created_at),
                 )
 
         src_map = {r["reading_id"]: r for r in src_rows}
@@ -361,9 +429,9 @@ def commit_merge(conn: sqlite3.Connection, token: str,
                     continue
                 if decision.action == "keep_source":
                     conn.execute(
-                        "UPDATE readings SET ts = ?, lux = ? "
+                        "UPDATE readings SET ts = ?, lux = ?, source_id = ? "
                         "WHERE exhibit_id = ? AND reading_id = ?",
-                        (s["ts"], s["lux"], target_id, rid),
+                        (s["ts"], s["lux"], s["source_id"], target_id, rid),
                     )
                     applied.append(MergeResolutionResult(reading_id=rid, action="keep_source"))
                     continue
@@ -371,20 +439,20 @@ def commit_merge(conn: sqlite3.Connection, token: str,
                 new_id = decision.new_id
                 assert new_id is not None
                 conn.execute(
-                    "INSERT INTO readings (exhibit_id, reading_id, ts, lux, received_at, "
-                    "voided_at, voided_by) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (target_id, new_id, s["ts"], s["lux"], s["received_at"],
+                    "INSERT INTO readings (exhibit_id, reading_id, ts, lux, source_id, "
+                    "received_at, voided_at, voided_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (target_id, new_id, s["ts"], s["lux"], s["source_id"], s["received_at"],
                      s["voided_at"], s["voided_by"]),
                 )
                 applied.append(
                     MergeResolutionResult(reading_id=rid, action="rename_source", new_id=new_id)
                 )
                 continue
-            # 仅来源存在：整体搬迁，保留读数 ID、原始接收时刻与作废标记
+            # 仅来源存在：整体搬迁，保留读数 ID、来源标识、原始接收时刻与作废标记
             conn.execute(
-                "INSERT INTO readings (exhibit_id, reading_id, ts, lux, received_at, "
-                "voided_at, voided_by) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (target_id, rid, s["ts"], s["lux"], s["received_at"],
+                "INSERT INTO readings (exhibit_id, reading_id, ts, lux, source_id, "
+                "received_at, voided_at, voided_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (target_id, rid, s["ts"], s["lux"], s["source_id"], s["received_at"],
                  s["voided_at"], s["voided_by"]),
             )
             moved += 1
@@ -448,6 +516,9 @@ def commit_merge(conn: sqlite3.Connection, token: str,
         conn.rollback()
         raise HTTPException(status_code=409, detail=f"归并预演已失效：{e}")
     except _ChainBroken as e:
+        conn.rollback()
+        raise HTTPException(status_code=409, detail=str(e))
+    except _PriorityConflict as e:
         conn.rollback()
         raise HTTPException(status_code=409, detail=str(e))
     except _CommitValidation as e:

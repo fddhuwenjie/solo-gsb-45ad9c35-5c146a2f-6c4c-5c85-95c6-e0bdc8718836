@@ -17,6 +17,12 @@
 - 支持**照度采集质量诊断**：在规范档案的完整时间线上识别缺测（`gap`）、
   突变（`jump`）、卡死（`stuck`）与同一时刻读数冲突（`timestamp_conflict`），
   事件边界不随查询窗口缩窄而改变；诊断为纯只读操作。
+- 支持**多来源读数仲裁**：上报读数可带 `source_id`，同一展品同一采样时刻的
+  不同来源全部留存；按**带生效时刻的来源优先级版本**仲裁权威值——最高优先级
+  来源胜出，最高级并列且照度不同的时刻保持冲突、不进入剂量与诊断时间线；
+  配置更新须携带 `expected_version`（过期返回 409），调整只从生效时刻起影响
+  重算，历史收据与原始读数绝不改写；提供权威时间线查询，旧请求不带
+  `source_id` 时保持原行为。
 - 支持 **RFID 馆藏盘点对账**：固定时间窗内按区域保留最高 RSSI，以最后一个
   有事件的窗口判定展品位置，多区域信号差不足阈值记为**位置不明**；稳定列出
   缺失 / 错位 / 意外出现 / 位置不明四类差异；盘点轮次与规范化请求摘要绑定，
@@ -76,8 +82,11 @@ SQLite 数据文件存放在命名卷 `lightdose-data`（容器内 `/data/lightd
 | PUT | `/exhibits/{id}/calendar` | 整体设置展陈开放日历（全量替换） |
 | GET | `/exhibits/{id}/calendar` | 查询展陈开放日历（未配置 → 404） |
 | DELETE | `/exhibits/{id}/calendar` | 删除展陈开放日历（幂等，204） |
-| POST | `/exhibits/{id}/readings` | 批量上报读数（幂等，支持乱序/补传；同事务生成存证收据） |
+| POST | `/exhibits/{id}/readings` | 批量上报读数（幂等，支持乱序/补传与 `source_id` 多来源；同事务生成存证收据） |
 | GET | `/exhibits/{id}/readings` | 按时间顺序列出读数 |
+| PUT | `/exhibits/{id}/source-priority` | 发布来源优先级版本（带生效时刻；`expected_version` 乐观并发，过期 409） |
+| GET | `/exhibits/{id}/source-priority` | 查询来源优先级配置（全部版本，按版本号升序） |
+| GET | `/exhibits/{id}/timeline` | 权威时间线查询：每个采样时刻的仲裁结果（权威值 / 保持冲突） |
 | GET | `/exhibits/{id}/receipts` | 列出存证收据链（按序号升序，别名自动解析） |
 | GET | `/exhibits/{id}/receipts/{seq}` | 查询单张存证收据（已作废批次在 `voids` 标出） |
 | POST | `/exhibits/{id}/receipts/corrections` | 照度上报批次更正：作废收据中实际插入的读数（幂等，request_key 重放/409） |
@@ -141,6 +150,11 @@ curl -s -X POST http://localhost:8000/exhibits/<id>/readings \
 - 同 ID **同数据**重传 → `duplicate`，忽略，不重复计入；
 - 同 ID **不同数据** → `conflict`，拒绝写入并在结果中标出；
 - 时间缺省时区按 **UTC** 处理。
+
+每条读数可带可选的 `source_id` 声明采集来源；`source_id` 属于读数数据
+的一部分（同 ID 但来源不同同样判为 `conflict`）。同一采样时刻不同来源的
+读数以不同读数 ID 全部留存，由来源优先级版本在查询时仲裁权威值，详见
+下文「多来源读数仲裁」；不带 `source_id` 的旧式请求行为完全不变。
 
 每次上报都会在写入读数的**同一事务**内生成一张存证收据（响应中的
 `receipt` 字段），详见下文「照度上报存证（收据链）」。需要把整批读数
@@ -261,6 +275,119 @@ curl -s -X POST http://localhost:8000/exhibits/<id>/readings/diagnose \
 `(start, 类型)` 稳定排序（起点相同时依次为 `gap`、`jump`、`stuck`、
 `timestamp_conflict`）。
 
+## 多来源读数仲裁
+
+同一件展品可能有多个采集来源（主传感器、备份传感器、巡检手持终端等）。
+读数上报时可携带 `source_id` 声明来源；**同一展品同一采样时刻的不同来源
+读数以不同读数 ID 全部留存**（读数 ID 仍是幂等键，`source_id` 是读数属性）。
+查询时按**来源优先级版本**逐时刻仲裁出权威值：
+
+- **来源优先级版本**：每次发布一版 `priorities`（来源标识按优先级从高到低
+  排列）并携带**生效时刻** `effective_at`；版本只增不改。对采样时刻 t 仲裁时
+  取 `effective_at <= t` 的**最新版本**（版本号最大者），因此**调整优先级只从
+  生效时刻起影响重算**——历史存证收据与原始读数行绝不改写，仲裁在查询时
+  实时进行；
+- **权威值选取**：在生效版本下取优先级最高的来源集合。集合内照度唯一 →
+  该值为该时刻权威值；**最高级并列且照度不同 → 该时刻保持冲突**，不进入
+  剂量核算与诊断时间线（诊断中仍作为 `timestamp_conflict` 事件出现，
+  剂量上表现为其前后相邻权威点之间的缺测段）；
+- **并列的情形**：未列入 `priorities` 的来源（含未声明来源的旧式读数）
+  **并列最低**；同一来源在同一时刻的多条读数天然同级。并列集合照度相同
+  则合并为一个权威点（读数 ID 全部保留）；
+- **未配置任何版本**：全部读数平权（同时刻同值合并、异值冲突），与多来源
+  功能上线前的行为完全一致；旧请求不带 `source_id` 时上报、幂等、收据、
+  剂量、诊断行为均不变；
+- **配置更新乐观并发**：发布新版本必须携带 `expected_version`（当前最新
+  版本号，尚无版本时为 0），与服务器不一致返回 **409**；并发更新只有一个
+  成功；
+- **别名与归并**：配置与时间线接口都先解析别名、命中规范档案。档案归并时
+  来源配置随档案合并：仅来源有才整体搬迁到目标；双方逐版本一致保留目标的
+  一份；**双方都有且不一致 → 归并 409 拒绝，冲突绝不静默覆盖**（预演响应
+  以 `source_priority_conflict` 与 `metadata.source_priority` 差异明示，
+  配置指纹也纳入归并版本令牌，预演后任一侧发布新版本同样使令牌失效）。
+
+### 4a. 上报带来源的读数
+
+```bash
+curl -s -X POST http://localhost:8000/exhibits/<id>/readings \
+  -H 'Content-Type: application/json' \
+  -d '{"readings": [
+        {"id": "a-0815", "ts": "2026-09-20T08:00:00Z", "lux": 100, "source_id": "sensor-a"},
+        {"id": "b-0801", "ts": "2026-09-20T08:00:00Z", "lux": 500, "source_id": "sensor-b"},
+        {"id": "a-0816", "ts": "2026-09-20T09:00:00Z", "lux": 100, "source_id": "sensor-a"}
+      ]}'
+```
+
+同一时刻的两条读数全部留存；存证收据的 `request.readings` 中同样记录
+`source_id`（未声明来源的旧式请求收据内容保持原样、不含该键）。读数 ID
+幂等规则不变：同 ID 且采样时刻、照度、来源标识完全一致 → `duplicate`，
+任一不同（含来源不同）→ `conflict`。
+
+### 4b. 发布来源优先级版本
+
+```bash
+# 首次发布：expected_version 为 0
+curl -s -X PUT http://localhost:8000/exhibits/<id>/source-priority \
+  -H 'Content-Type: application/json' \
+  -d '{"effective_at": "2026-09-20T00:00:00Z",
+       "priorities": ["sensor-a", "sensor-b"],
+       "expected_version": 0}'
+```
+
+```json
+{"requested_id": "...", "canonical_id": "...", "version": 1,
+ "effective_at": "2026-09-20T00:00:00Z",
+ "priorities": ["sensor-a", "sensor-b"],
+ "created_at": "2026-09-21T01:23:45.678Z"}
+```
+
+```bash
+# 调整优先级：自新的生效时刻起影响重算；expected_version 过期 → 409
+curl -i -X PUT http://localhost:8000/exhibits/<id>/source-priority \
+  -H 'Content-Type: application/json' \
+  -d '{"effective_at": "2026-09-21T00:00:00Z",
+       "priorities": ["sensor-b", "sensor-a"],
+       "expected_version": 0}'
+# HTTP/1.1 409 Conflict
+# {"detail": "来源优先级配置已过期：当前最新版本为 1，请求携带 expected_version=0，请重新读取配置后重试"}
+
+# 查询全部版本（GET 不解析失败：未配置时 current_version 为 0、versions 为空）
+curl -s http://localhost:8000/exhibits/<id>/source-priority
+```
+
+### 4c. 权威时间线查询
+
+```bash
+curl -s 'http://localhost:8000/exhibits/<id>/timeline?start=2026-09-20T08:00:00Z&end=2026-09-20T09:00:00Z'
+```
+
+```json
+{
+  "requested_id": "...", "canonical_id": "...",
+  "start": "2026-09-20T08:00:00Z", "end": "2026-09-20T09:00:00Z",
+  "arbitrated": true,
+  "entries": [
+    {"ts": "2026-09-20T08:00:00Z", "status": "ok", "lux": 100.0,
+     "reading_ids": ["a-0815"], "source_ids": ["sensor-a"],
+     "priority_version": 1},
+    {"ts": "2026-09-20T09:00:00Z", "status": "ok", "lux": 100.0,
+     "reading_ids": ["a-0816"], "source_ids": ["sensor-a"],
+     "priority_version": 1}
+  ]
+}
+```
+
+- `status=ok`：该时刻仲裁成功，`lux` 为权威照度，`reading_ids` /
+  `source_ids` 为胜出集合（被仲裁丢弃的低优先级读数不进入时间线）；
+- `status=conflict`：最高级并列且照度不同，该时刻保持冲突（给出并列
+  读数与 `lux_span`），**不进入剂量与诊断时间线**；
+- `priority_version` 为该时刻生效的优先级版本号（无生效版本、平权仲裁
+  时为 `null`）；`arbitrated=false` 表示展品未配置任何版本，全部读数平权。
+
+配置优先级后，剂量查询（含 `calendar=display`）与采集质量诊断都基于权威
+时间线：上例中 08:00 时刻按 `sensor-a` 的 100 lux 计入，`sensor-b` 的
+500 lux 被仲裁丢弃；剂量响应的 `reading_count` 为窗口内权威点数量。
+
 ## 展陈开放日历
 
 每件展品可配置一份展陈开放日历，剂量查询据此只在开放时段内累计剂量：
@@ -343,6 +470,11 @@ curl -s 'http://localhost:8000/exhibits/<id>/dose?start=2026-09-20T00:00:00Z&end
   归并后剂量核算继续沿用原有梯形法算法与目标档案参数；
 - 目标档案的**展陈开放日历**保持不变；来源档案的日历随档案删除一并清除，
   归并后来源别名访问日历与 `calendar=display` 核算都命中目标档案的日历；
+- 来源档案的**来源优先级配置**随归并合并：仅来源有才整体搬迁到目标
+  （版本号保持）；双方逐版本一致时保留目标的一份；双方都有且不一致时
+  **归并 409 拒绝，冲突绝不静默覆盖**——预演响应以
+  `source_priority_conflict=true` 与 `metadata.source_priority` 差异明示，
+  且配置指纹纳入版本令牌，预演后任一侧发布新版本同样使令牌失效；
 - 仅来源存在的读数整体搬迁；同读数 ID 且**时间、照度一致**的碰撞自动去重；
   同 ID 但**内容不同**的碰撞必须逐条选择 `keep_target`（保留目标）、
   `keep_source`（用来源覆盖目标）或 `rename_source`（为来源读数指定新 ID），
@@ -1154,22 +1286,24 @@ uvicorn app.main:app --reload  # 本地起服务，默认 http://127.0.0.1:8000
 
 ```
 ├── app/
-│   ├── main.py      # FastAPI 路由：展品 / 读数 / 存证收据 / 剂量查询 / 采集质量诊断 / 展陈日历 / 档案归并
+│   ├── main.py      # FastAPI 路由：展品 / 读数 / 存证收据 / 剂量查询 / 采集质量诊断 / 展陈日历 / 档案归并 / 来源优先级 / 权威时间线
 │   ├── dose.py      # 核算核心：梯形法、缺测段、首次越线求解、开放区间裁剪
 │   ├── diagnose.py  # 采集质量诊断：同值合并 / 时间冲突 / gap / jump / 最大 stuck、完整时间线与窗口筛选
+│   ├── arbitration.py # 多来源读数仲裁：来源优先级版本、逐时刻权威值选取、并列冲突、诊断输入展开
 │   ├── calendar.py  # 展陈开放日历：每周规则 + 日期例外展开、跨午夜、夏令时边界解析
-│   ├── merge.py     # 重复档案归并：预演、版本令牌、单事务提交、永久别名、归并前收据链校验
+│   ├── merge.py     # 重复档案归并：预演、版本令牌、单事务提交、永久别名、归并前收据链校验、来源配置合并
 │   ├── inventory.py # RFID 盘点对账：固定窗口最高 RSSI 定位、信号差阈值判不明、四类差异、请求摘要绑定与并发固化
 │   ├── evacuation.py # 应急撤离编排：时变最早到达搜索、[进入,离开) 半开容量计数、封闭等待/绕行、路径字典序决胜（纯只读）
 │   ├── receipts.py  # 照度上报存证：收据规范序列化、SHA-256 链哈希、整链校验
 │   ├── corrections.py # 上报批次更正：作废收据中实际插入的读数、request_key 幂等、前置变化整次 409
 │   ├── snapshots.py # SQLite 在线快照：backup 热备、临时文件 + SHA-256 清单 + 原子重命名、只读校验
-│   ├── db.py        # SQLite 连接与建表（exhibits / readings / ingest_receipts / exhibit_aliases / merge_previews / 日历四表 / inventory_rounds / reading_corrections）
+│   ├── db.py        # SQLite 连接与建表（exhibits / readings / ingest_receipts / exhibit_aliases / merge_previews / 日历四表 / inventory_rounds / reading_corrections / source_priority_versions）
 │   └── schemas.py   # Pydantic 请求/响应模型
 ├── tests/
 │   ├── test_api.py       # 剂量核算与归并
 │   ├── test_diagnose.py  # 照度采集质量诊断
 │   ├── test_calendar.py  # 展陈开放日历
+│   ├── test_arbitration.py # 多来源仲裁：source_id 留存、优先级版本/生效时刻、并列冲突、权威时间线、归并合并配置
 │   ├── test_receipts.py  # 照度上报存证：收据链、整链校验、并发顺序、归并保留
 │   ├── test_corrections.py # 上报批次更正：仅作废 inserted、重放/换目标 409、链/归并/归属变化 409、查询排除
 │   ├── test_inventory.py # RFID 盘点对账：窗口定位、四类差异、别名解析、摘要重放/409、并发固化、隔离性
