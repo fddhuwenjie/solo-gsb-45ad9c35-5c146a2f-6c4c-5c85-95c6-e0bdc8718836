@@ -15,6 +15,9 @@
   remaining_luxh / exceeded / first_exceeded_at 则依据**截至窗口末的
   全历史累计**计算（带日历时只累计开放历史），因此首次越线时刻不会随
   查询窗口缩窄而改变。
+- 多来源仲裁冲突时刻（``break_ts``）有歧义：积分**不可跨过**该时刻，两个
+  口径在冲突点两侧都不把跨越段连成一段。无冲突时（旧请求不带 source_id）
+  传入空集合，行为与旧版完全一致。
 - 剂量在查询时实时计算，乱序到达或补传的读数会立即反映到结果中。
 """
 from __future__ import annotations
@@ -103,6 +106,7 @@ def compute_dose(
     max_interval_s: float,
     dose_limit_luxh: float,
     open_intervals: list[tuple[float, float]] | None = None,
+    break_ts: set[float] | None = None,
 ) -> DoseResult:
     """核算时段剂量。
 
@@ -116,7 +120,12 @@ def compute_dose(
     ``open_intervals`` 为展陈日历展开后的绝对开放区间（Unix 秒，升序、互不
     重叠），须覆盖从最早读数到窗口末的全部相关时间；传入后积分只在开放
     区间内裁剪，历史口径也只累计开放历史。为 None 时保持原有口径。
+
+    ``break_ts`` 为多来源仲裁冲突时刻集合：相邻读数段内部（开区间）一旦
+    包含冲突时刻，该段有歧义、不参与积分（两侧读数不被跨接）。为空或 None
+    时与旧版完全一致。
     """
+    break_ts = break_ts or set()
     window_known = 0.0
     covered = 0.0
     history_known = 0.0
@@ -127,7 +136,10 @@ def compute_dose(
     for ts, lux in readings:
         if prev_ts is not None:
             dt = ts - prev_ts
-            if dt > 0.0 and dt <= max_interval_s:
+            # 仲裁冲突时刻落在线段内部（开区间）时该段整体不积分；冲突时刻
+            # 恰与端点重合时已由仲裁侧剔除该点，这里不再额外截断。
+            crossed_break = any(prev_ts < b < ts for b in break_ts)
+            if dt > 0.0 and dt <= max_interval_s and not crossed_break:
                 # ---- 窗口口径：与 [start_s, end_s]（及开放区间）求交后梯形裁剪 ----
                 for lo, hi in _pieces(prev_ts, ts, start_s, end_s, open_intervals):
                     l_lo = _lux_at(prev_lux, lux, (lo - prev_ts) / dt)

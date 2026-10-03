@@ -15,8 +15,10 @@
   在单个事务内提交，来源 ID 归并后成为目标 ID 的**永久别名**，所有查询与上报
   自动解析到规范档案（归并保留目标档案的展陈日历）；
 - 支持**照度采集质量诊断**：在规范档案的完整时间线上识别缺测（`gap`）、
-  突变（`jump`）、卡死（`stuck`）与同一时刻读数冲突（`timestamp_conflict`），
-  事件边界不随查询窗口缩窄而改变；诊断为纯只读操作。
+  突变（`jump`）、卡死（`stuck`）与同一时刻读数冲突（`timestamp_conflict`，
+  仅无来源优先级版本生效的 legacy 时刻沿用旧口径），事件边界不随查询窗口
+  缩窄而改变；多来源仲裁的并列冲突时刻不入诊断时间线（链在其两侧中断），
+  由权威时间线查询显式给出；诊断为纯只读操作。
 - 支持 **RFID 馆藏盘点对账**：固定时间窗内按区域保留最高 RSSI，以最后一个
   有事件的窗口判定展品位置，多区域信号差不足阈值记为**位置不明**；稳定列出
   缺失 / 错位 / 意外出现 / 位置不明四类差异；盘点轮次与规范化请求摘要绑定，
@@ -48,6 +50,15 @@
   创建 / 列表 / 下载，并可在独立只读连接上核对哈希、执行
   `integrity_check` 与 `foreign_key_check`；并发创建只允许一个，其余 409，
   失败或未完成的文件绝不出现在列表中。
+- 支持**多来源读数仲裁**：上报读数可携带 `source_id`，同一展品同一采样
+  时刻的不同来源读数**全部留存、互不覆盖**；规范档案维护**带生效时刻、
+  只增不改**的来源优先级版本，查询时按采样时刻适用的版本选**最高优先级
+  来源**为权威值（未列入来源与旧读数归入最低档），最高优先级一档并列且
+  照度不一致时该时刻**保持冲突**，不进入剂量与诊断时间线（可经权威时间线
+  查询核查）；配置更新须携带 `expected_version`，过期返回 **409**；调整
+  优先级**只从生效时刻起**影响重算，历史收据与原始读数不改写；归并时
+  合并两边来源配置、冲突必须逐条裁决不得静默覆盖；旧请求不带 `source_id`
+  且未配置优先级时行为与旧版完全一致。
 
 ## 快速开始（Docker Compose 一键启动）
 
@@ -76,8 +87,11 @@ SQLite 数据文件存放在命名卷 `lightdose-data`（容器内 `/data/lightd
 | PUT | `/exhibits/{id}/calendar` | 整体设置展陈开放日历（全量替换） |
 | GET | `/exhibits/{id}/calendar` | 查询展陈开放日历（未配置 → 404） |
 | DELETE | `/exhibits/{id}/calendar` | 删除展陈开放日历（幂等，204） |
-| POST | `/exhibits/{id}/readings` | 批量上报读数（幂等，支持乱序/补传；同事务生成存证收据） |
-| GET | `/exhibits/{id}/readings` | 按时间顺序列出读数 |
+| POST | `/exhibits/{id}/readings` | 批量上报读数（幂等，支持乱序/补传/多来源 source_id；同事务生成存证收据） |
+| GET | `/exhibits/{id}/readings` | 按时间顺序列出读数（含 source_id） |
+| PUT | `/exhibits/{id}/source-priorities` | 新增来源优先级版本（带生效时刻；expected_version 乐观并发，过期 409） |
+| GET | `/exhibits/{id}/source-priorities` | 读取来源优先级配置（全部历史版本；从未配置返回空版本 0） |
+| GET | `/exhibits/{id}/authoritative-timeline` | 查询逐时刻多来源仲裁结果（权威值/并列冲突/legacy，含全部留存候选） |
 | GET | `/exhibits/{id}/receipts` | 列出存证收据链（按序号升序，别名自动解析） |
 | GET | `/exhibits/{id}/receipts/{seq}` | 查询单张存证收据（已作废批次在 `voids` 标出） |
 | POST | `/exhibits/{id}/receipts/corrections` | 照度上报批次更正：作废收据中实际插入的读数（幂等，request_key 重放/409） |
@@ -115,17 +129,22 @@ curl -s -X POST http://localhost:8000/exhibits \
  "created_at": "2026-09-20T08:00:00.000Z"}
 ```
 
-### 2. 上报读数（乱序、可重传）
+### 2. 上报读数（乱序、可重传、多来源）
 
 ```bash
 curl -s -X POST http://localhost:8000/exhibits/<id>/readings \
   -H 'Content-Type: application/json' \
   -d '{"readings": [
-        {"id": "r2", "ts": "2026-09-20T09:00:00Z", "lux": 100},
-        {"id": "r1", "ts": "2026-09-20T08:00:00Z", "lux": 100},
+        {"id": "r2", "ts": "2026-09-20T09:00:00Z", "lux": 100, "source_id": "sensor-A"},
+        {"id": "r1", "ts": "2026-09-20T08:00:00Z", "lux": 100, "source_id": "sensor-A"},
         {"id": "r3", "ts": "2026-09-20T10:00:00Z", "lux": 200}
       ]}'
 ```
+
+每条读数可带 `source_id`（采集器 / 传感器来源）。**同一展品同一采样时刻的
+不同来源读数全部留存**，互不覆盖；是否进入权威剂量/诊断时间线由来源优先级
+版本在查询时仲裁（见下文「多来源读数仲裁」）。不带 `source_id` 的旧请求
+行为不变。
 
 ```json
 {"requested_id": "...", "canonical_id": "...", "inserted": 3,
@@ -138,8 +157,10 @@ curl -s -X POST http://localhost:8000/exhibits/<id>/readings \
 
 幂等规则（读数 ID 为幂等键，按展品隔离）：
 
-- 同 ID **同数据**重传 → `duplicate`，忽略，不重复计入；
-- 同 ID **不同数据** → `conflict`，拒绝写入并在结果中标出；
+- 同 ID **同数据**（时间、照度、`source_id` 全部一致）重传 → `duplicate`，
+  忽略，不重复计入；
+- 同 ID **不同数据**（时间、照度或 `source_id` 任一不同）→ `conflict`，
+  拒绝写入并在结果中标出；
 - 时间缺省时区按 **UTC** 处理。
 
 每次上报都会在写入读数的**同一事务**内生成一张存证收据（响应中的
@@ -261,6 +282,185 @@ curl -s -X POST http://localhost:8000/exhibits/<id>/readings/diagnose \
 `(start, 类型)` 稳定排序（起点相同时依次为 `gap`、`jump`、`stuck`、
 `timestamp_conflict`）。
 
+## 多来源读数仲裁（source_id + 来源优先级版本）
+
+展品可能同时被多个采集器 / 传感器（`source_id`）读数：同一采样时刻收到
+多个来源的照度时，服务**全部留存原始读数**，再由**带生效时刻的来源优先级
+版本**在查询时仲裁出权威时间线。剂量核算与采集质量诊断只消费仲裁后的
+权威时间线；原始读数与存证收据永不因配置调整而改写。
+
+### 仲裁规则（按采样时刻）
+
+- 上报：读数可带 `source_id`。同一展品同一采样时刻的不同来源读数全部保留，
+  读数 ID 幂等仍按 `(展品, 读数 ID)`（含 source_id 内容）判定；
+- 优先级版本：每件展品维护一份**只增不改**的版本序列。每个版本携带
+  `effective_at`（生效时刻，**含端点**）与一份**完整**的来源优先级清单，
+  `priority` 为整数、**越大越权威**，同值为并列档；同版本内 source_id 唯一；
+- 采样时刻 `t` 适用的版本是 `effective_at <= t` 的**最新版本**；
+  早于第一个版本的采样时刻没有适用版本（见下 legacy）；
+- 时刻内裁决：
+
+  1. 读数来源被适用版本列入 → 取该来源的优先级；**未列入来源**（含未标注
+     `source_id` 的旧读数）归入**最低档**，低于任何已列来源；
+  2. 取在场**最高优先级一档**的读数为权威候选；
+  3. 候选照度**全部相同** → 该时刻为**权威点**，照度取该值，全部并列读数
+     ID 与来源 ID 保留（同时刻同值多读数合并为一个点）；
+  4. 候选照度**不一致** → 该时刻**保持冲突**（最高优先级并列且照度不同），
+     `status=conflict`，**不进入剂量积分，也不进入诊断连续链**——剂量不可
+     跨过冲突时刻积分（两侧读数不跨接），诊断链在冲突时刻两侧中断；
+     冲突时刻仍可在权威时间线查询中显式核查（`candidates` 给出全部留存读数）。
+
+- **legacy（无适用版本）**：该时刻所有读数（无论是否标注来源）保持旧行为：
+  原始读数各自成点、逐对进入梯形积分（同时刻零间隔），诊断沿用同值合并 /
+  异值 `timestamp_conflict`。因此**旧请求不带 `source_id`、也未配置优先级时
+  结果与旧版完全一致**。
+- **调整优先级只从生效时刻起影响重算**：写入新版本不修改任何历史版本、
+  原始读数或收据；早于新生效时刻的采样仍按旧版本仲裁，查询剂量/诊断时
+  实时重放，天然得到“历史收据不改写”的效果。
+
+### 21. 配置来源优先级（PUT：全量新版本 + expected_version）
+
+```bash
+# 首次配置：expected_version=0；sensor-A 优先级 10、sensor-B 优先级 5，
+# 从 2026-09-20T00:00:00Z 起生效
+curl -s -X PUT http://localhost:8000/exhibits/<id>/source-priorities \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "expected_version": 0,
+    "effective_at": "2026-09-20T00:00:00Z",
+    "priorities": [
+      {"source_id": "sensor-A", "priority": 10},
+      {"source_id": "sensor-B", "priority": 5}
+    ]
+  }'
+```
+
+```json
+{
+  "requested_id": "<id>", "canonical_id": "<id>", "current_version": 1,
+  "versions": [
+    {"version": 1, "effective_at": "2026-09-20T00:00:00.000Z",
+     "created_at": "2026-09-20T12:00:00.000Z",
+     "priorities": [
+       {"source_id": "sensor-A", "priority": 10},
+       {"source_id": "sensor-B", "priority": 5}]}
+  ]
+}
+```
+
+- `expected_version` 为**乐观并发令牌**：必须等于服务端当前最新版本号
+  （从未配置为 `0`）；并发更新或基于过期版本提交返回 **409**，需重新
+  `GET` 配置后携带新版本号重试；
+- `priorities` 为新版本的**完整清单（整体写入，不增量合并）**；至少一条，
+  同版本 source_id 不得重复（422）；同一生效时刻不得重复建版本（422）——
+  版本只增不改，要改请用新的 `effective_at`；
+- 生效时刻允许指向过去（补录优先级），也允许指向未来（预约生效）；
+- 读取：`GET /exhibits/{id}/source-priorities` 返回全部历史版本（按生效
+  时刻升序）；从未配置时 `current_version=0`、`versions=[]`；别名 ID 自动
+  解析到规范档案。
+
+```bash
+# 过期 expected_version → 409
+curl -i -X PUT http://localhost:8000/exhibits/<id>/source-priorities \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_version": 0, "effective_at": "2026-10-01T00:00:00Z",
+       "priorities": [{"source_id": "sensor-A", "priority": 1}]}'
+# HTTP/1.1 409 Conflict
+# {"detail":"来源优先级配置版本已过期：expected_version=0，当前最新版本为 1；
+#  请重新读取配置后基于最新版本号提交"}
+```
+
+### 22. 查询权威时间线
+
+`GET /exhibits/{id}/authoritative-timeline` 按采样时刻升序返回逐时刻仲裁
+结果（支持 `start` / `end` 含端点窗口与 `limit`）：
+
+```bash
+curl -s 'http://localhost:8000/exhibits/<id>/authoritative-timeline?start=2026-09-20T08:00:00Z&end=2026-09-20T12:00:00Z'
+```
+
+```json
+{
+  "requested_id": "<id>", "canonical_id": "<id>",
+  "start": "2026-09-20T08:00:00.000Z", "end": "2026-09-20T12:00:00.000Z",
+  "current_version": 2,
+  "points": [
+    {"ts": "2026-09-20T09:00:00.000Z", "status": "authoritative",
+     "version": 1, "lux": 100.0, "priority": 10,
+     "source_ids": ["sensor-A"], "reading_ids": ["a-0900"], "lux_span": null,
+     "candidates": [
+       {"id": "a-0900", "ts": "2026-09-20T09:00:00.000Z", "lux": 100.0, "source_id": "sensor-A"},
+       {"id": "b-0900", "ts": "2026-09-20T09:00:00.000Z", "lux": 102.0, "source_id": "sensor-B"}]},
+    {"ts": "2026-09-20T10:00:00.000Z", "status": "conflict",
+     "version": 1, "lux": null, "priority": 10,
+     "source_ids": ["sensor-A", "sensor-C"], "reading_ids": ["a-1000", "c-1000"],
+     "lux_span": 80.0,
+     "candidates": [ /* 该时刻全部留存读数，含未列入来源 sensor-Z */ ]},
+    {"ts": "2026-09-20T07:00:00.000Z", "status": "legacy",
+     "version": null, "lux": 50.0, "priority": null,
+     "source_ids": [], "reading_ids": ["old-0700"], "lux_span": null,
+     "candidates": [ /* ... */ ]}
+  ]
+}
+```
+
+| status | 含义 |
+|---|---|
+| `authoritative` | 按生效版本仲裁出唯一权威照度；`lux` 为权威值，`reading_ids` 为同值并列的全部读数 |
+| `conflict` | 最高优先级一档并列来源照度不一致；`lux=null`、`lux_span` 为照度跨度，该时刻**不进剂量/诊断时间线**；`candidates` 含全部留存读数供核查 |
+| `legacy` | 该时刻无生效版本，保持旧行为；原始照度不一致时 `lux=null`、`lux_span` 为原始跨度 |
+
+剂量接口 `reading_count` 随之采用权威口径：权威点每时刻计 1（同值并列
+合并），冲突时刻计 0；legacy 时刻仍按原始读数条数计。
+
+### 23. 归并时合并来源配置（冲突不得静默覆盖）
+
+档案归并会把两边的来源优先级配置按生效时刻合并到目标档案：
+
+- 某来源**只在一侧**配置 → 自动并入并集（无需裁决）；
+- 同一生效时刻两侧**都定义了**同一来源但优先级不同（或一侧条目结束、
+  另一侧仍保留）→ 预演在 `priority_collisions` 中逐条列出，提交时必须给出
+  `priority_resolutions`（`keep_source` / `keep_target`），**未全部解决
+  422**，冲突不得静默覆盖；
+- 预演令牌绑定两边优先级配置快照，预演后任一侧配置变更 → 提交 **409**；
+- 合并在归并的同一事务内重写目标配置（历史读数与收据仍不改写）；
+- 归并后用来源别名访问 `/source-priorities`、上报读数、查权威时间线或
+  剂量，都命中目标规范档案与其合并后的配置。
+
+```bash
+curl -s -X POST http://localhost:8000/merges/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"source_id": "DUP-042", "target_id": "EX-042"}'
+# 响应中：
+# "priority_collisions": [
+#   {"source_id": "sensor-A", "effective_at": "2026-09-20T00:00:00.000Z",
+#    "source_priority": 1, "target_priority": 10}],
+# "ready_to_commit": false
+
+curl -s -X POST http://localhost:8000/merges/commit \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "token": "<preview-token>",
+    "resolutions": [],
+    "priority_resolutions": [
+      {"source_id": "sensor-A", "effective_at": "2026-09-20T00:00:00Z",
+       "action": "keep_target"}
+    ]
+  }'
+# 响应 "priority_resolutions_applied" 列出每条裁决及其后生效的优先级
+```
+
+### 与既有能力的关系
+
+- **剂量 / 诊断**：都在查询时先按同一版本序列仲裁；冲突时刻不积分、中断
+  诊断链（但不作为采集质量事件重复上报，权威时间线已显式给出）；`calendar=
+  display` 的开放区间裁剪在权威点序列上进行，口径不变；
+- **批次更正（作废）**：作废是软删除，作废读数立即退出仲裁并重算；更正
+  的读数归属校验包含 `source_id`；收据内容、序号与链哈希不变；
+- **存证收据**：仅当上报携带 `source_id` 时收据才记录该字段，旧收据缺键
+  等价于未标注来源，历史内容哈希逐字节可复现；
+- **快照**：来源优先级两张新表随 SQLite 在线快照一并备份与校验。
+
 ## 展陈开放日历
 
 每件展品可配置一份展陈开放日历，剂量查询据此只在开放时段内累计剂量：
@@ -347,8 +547,13 @@ curl -s 'http://localhost:8000/exhibits/<id>/dose?start=2026-09-20T00:00:00Z&end
   同 ID 但**内容不同**的碰撞必须逐条选择 `keep_target`（保留目标）、
   `keep_source`（用来源覆盖目标）或 `rename_source`（为来源读数指定新 ID），
   **未全部解决不得提交**；
-- 预演返回的 `token` 绑定两边元数据与读数集合版本；预演后任一档案被写入/修改/删除，
-  提交返回 **409** 且不产生任何部分变更，需要重新预演；
+- 预演返回的 `token` 绑定两边元数据、读数集合与**来源优先级配置**版本；
+  预演后任一档案被写入/修改/删除（含调整来源优先级），提交返回 **409**
+  且不产生任何部分变更，需要重新预演；
+- 归并同时**合并两边的来源优先级配置**：仅一侧配置的来源自动并入并集；
+  同一生效时刻两侧对同一来源优先级不一致（含一侧条目结束）的冲突在预演
+  `priority_collisions` 中列出，提交必须逐条 `keep_source` / `keep_target`
+  裁决，未全部解决 422，**冲突不得静默覆盖**（详见「多来源读数仲裁」）；
 - 提交在**单个 SQLite 事务**内完成；重复使用同一令牌返回首次提交的原结果
   （`already_committed: true`）；
 - 归并后来源 ID 成为目标 ID 的**永久别名**（不可删、不可重新建档），
@@ -1158,16 +1363,18 @@ uvicorn app.main:app --reload  # 本地起服务，默认 http://127.0.0.1:8000
 │   ├── dose.py      # 核算核心：梯形法、缺测段、首次越线求解、开放区间裁剪
 │   ├── diagnose.py  # 采集质量诊断：同值合并 / 时间冲突 / gap / jump / 最大 stuck、完整时间线与窗口筛选
 │   ├── calendar.py  # 展陈开放日历：每周规则 + 日期例外展开、跨午夜、夏令时边界解析
-│   ├── merge.py     # 重复档案归并：预演、版本令牌、单事务提交、永久别名、归并前收据链校验
+│   ├── merge.py     # 重复档案归并：预演、版本令牌、单事务提交、永久别名、归并前收据链校验、来源优先级配置并集合并与冲突裁决
+│   ├── arbitration.py # 多来源仲裁：来源优先级版本（生效时刻/expected_version）、按采样时刻选取权威值/并列冲突、权威时间线
 │   ├── inventory.py # RFID 盘点对账：固定窗口最高 RSSI 定位、信号差阈值判不明、四类差异、请求摘要绑定与并发固化
 │   ├── evacuation.py # 应急撤离编排：时变最早到达搜索、[进入,离开) 半开容量计数、封闭等待/绕行、路径字典序决胜（纯只读）
 │   ├── receipts.py  # 照度上报存证：收据规范序列化、SHA-256 链哈希、整链校验
 │   ├── corrections.py # 上报批次更正：作废收据中实际插入的读数、request_key 幂等、前置变化整次 409
 │   ├── snapshots.py # SQLite 在线快照：backup 热备、临时文件 + SHA-256 清单 + 原子重命名、只读校验
-│   ├── db.py        # SQLite 连接与建表（exhibits / readings / ingest_receipts / exhibit_aliases / merge_previews / 日历四表 / inventory_rounds / reading_corrections）
+│   ├── db.py        # SQLite 连接与建表（exhibits / readings（含 source_id）/ ingest_receipts / exhibit_aliases / merge_previews / 日历四表 / inventory_rounds / reading_corrections / 来源优先级两表）
 │   └── schemas.py   # Pydantic 请求/响应模型
 ├── tests/
 │   ├── test_api.py       # 剂量核算与归并
+│   ├── test_sources.py   # 多来源仲裁：source_id 留存/幂等、优先级版本 expected_version 409、生效时刻重算、并列冲突剔除、归并配置冲突裁决、别名命中
 │   ├── test_diagnose.py  # 照度采集质量诊断
 │   ├── test_calendar.py  # 展陈开放日历
 │   ├── test_receipts.py  # 照度上报存证：收据链、整链校验、并发顺序、归并保留

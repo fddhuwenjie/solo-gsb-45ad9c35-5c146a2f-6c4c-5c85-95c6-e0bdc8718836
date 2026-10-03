@@ -21,7 +21,15 @@ from .calendar import (
 )
 from .corrections import correct_receipt, voids_for_rows
 from .db import get_conn, init_db
-from .diagnose import build_events, intersect_window, sort_events
+from .arbitration import (
+    arbitrate,
+    authoritative_points,
+    build_timeline_out,
+    list_versions,
+    load_priority_config,
+    put_priority_config,
+)
+from .diagnose import build_events_from_groups, intersect_window, sort_events
 from .dose import compute_dose
 from .evacuation import EvacuationGraph, EvacuationGraphError, plan_evacuation
 from .inventory import load_round, reconcile_round
@@ -33,6 +41,7 @@ from .receipts import (
     verify_chain_rows,
 )
 from .schemas import (
+    AuthoritativeTimelineOut,
     CalendarConfigIn,
     CalendarExceptionDayOut,
     CalendarOut,
@@ -71,6 +80,8 @@ from .schemas import (
     SnapshotListOut,
     SnapshotOut,
     SnapshotVerifyOut,
+    SourcePriorityConfigOut,
+    SourcePriorityPut,
     ensure_aware,
     format_local_time,
     parse_local_time,
@@ -95,7 +106,7 @@ async def lifespan(_: FastAPI) -> Iterator[None]:
 
 app = FastAPI(
     title="馆藏展品光照剂量核算 API",
-    version="1.8.0",
+    version="1.9.0",
     description="登记展品光照上限，接收乱序/补传照度读数，按梯形法累计 lux·h，缺测段不插值；"
                 "支持展陈开放日历（IANA 时区 + 每周时段 + 日期例外），剂量可按开放时段裁剪核算；"
                 "支持重复展品档案预演归并，来源 ID 归并后成为目标 ID 的永久别名；"
@@ -111,6 +122,13 @@ app = FastAPI(
                 "按优先级降序/规范 ID 升序逐件做时变最早到达搜索，占用按 [进入,离开) 计数，"
                 "容量满或封闭时等待到首个可行时刻，同时刻按完整路径字典序决胜；"
                 "编排为纯只读计算，不写读数、日历、盘点轮次或收据链）；"
+                "支持多来源读数仲裁：读数可携带来源 ID 且同时刻多来源读数全部留存，"
+                "规范档案维护只增不改、带生效时刻的来源优先级版本（更新须携带 "
+                "expected_version，过期 409），按采样时刻适用版本取最高优先级为权威值，"
+                "最高级并列且照度不同则该时刻保持冲突、不进入剂量与诊断时间线；"
+                "优先级调整只从生效时刻起影响重算，历史收据与原始读数不改写；"
+                "归并时合并两边来源配置、冲突逐条裁决不得静默覆盖，"
+                "并提供权威时间线查询（旧请求不带 source_id 行为不变）；"
                 "每次批量上报在写入读数的同一事务内生成 SHA-256 链式存证收据"
                 "（并发下序号唯一连续，失败事务不留收据），支持收据查询与整链校验，"
                 "档案归并保留双方既有链、新上报继续接入目标原链；"
@@ -301,8 +319,13 @@ def ingest_readings(
 
     请求 ID 若是已归并档案的别名，自动解析到规范档案。
 
-    读数 ID 幂等：同 ID 同数据重复上报记为 duplicate，不重复计入；
-    同 ID 不同数据记为 conflict，拒绝写入并在结果中标出。
+    读数 ID 幂等：同 ID 同数据（含 source_id）重复上报记为 duplicate，不重复
+    计入；同 ID 不同数据（时间、照度或来源任一不同）记为 conflict，拒绝写入
+    并在结果中标出。
+
+    每条读数可携带 ``source_id``（采集器 / 传感器来源）：同一展品同一采样
+    时刻的不同来源读数**全部留存**，互不覆盖；是否进入权威剂量/诊断时间线
+    由来源优先级版本在查询时仲裁决定。不带 ``source_id`` 的旧请求行为不变。
 
     存证：收据按稳定规范序列化记录请求内容与逐条结果，并以 SHA-256
     链哈希衔接上一张收据；并发上报在写锁内分配序号，形成唯一连续顺序；
@@ -321,17 +344,24 @@ def ingest_readings(
             ts = r.ts.timestamp()
             try:
                 conn.execute(
-                    "INSERT INTO readings (exhibit_id, reading_id, ts, lux) VALUES (?, ?, ?, ?)",
-                    (canonical_id, r.id, ts, r.lux),
+                    "INSERT INTO readings (exhibit_id, reading_id, ts, lux, source_id) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (canonical_id, r.id, ts, r.lux, r.source_id),
                 )
                 status = "inserted"
                 inserted += 1
             except sqlite3.IntegrityError:
                 existing = conn.execute(
-                    "SELECT ts, lux FROM readings WHERE exhibit_id = ? AND reading_id = ?",
+                    "SELECT ts, lux, source_id FROM readings "
+                    "WHERE exhibit_id = ? AND reading_id = ?",
                     (canonical_id, r.id),
                 ).fetchone()
-                if existing is not None and existing["ts"] == ts and existing["lux"] == r.lux:
+                if (
+                    existing is not None
+                    and existing["ts"] == ts
+                    and existing["lux"] == r.lux
+                    and existing["source_id"] == r.source_id
+                ):
                     status = "duplicate"
                     duplicates += 1
                 else:
@@ -339,15 +369,20 @@ def ingest_readings(
                     conflicts += 1
             results.append(ReadingResult(id=r.id, status=status))
 
+        # 收据与读数同一事务落库：任一失败整体回滚，失败事务不留收据。
+        # 仅携带来源时才写入 source_id 键：旧版收据缺该键，哈希仍逐字节可复现。
+        receipt_readings = []
+        for r in batch.readings:
+            item = {"id": r.id, "ts": request_ts_iso(r.ts), "lux": r.lux}
+            if r.source_id is not None:
+                item["source_id"] = r.source_id
+            receipt_readings.append(item)
         # 收据与读数同一事务落库：任一失败整体回滚，失败事务不留收据
         receipt_row = mint_receipt(
             conn,
             chain_id=canonical_id,
             requested_id=exhibit_id,
-            readings=[
-                {"id": r.id, "ts": request_ts_iso(r.ts), "lux": r.lux}
-                for r in batch.readings
-            ],
+            readings=receipt_readings,
             results=[{"id": x.id, "status": x.status} for x in results],
             inserted=inserted,
             duplicates=duplicates,
@@ -395,10 +430,74 @@ def list_readings(
         canonical_id=canonical_id,
         readings=[
             ReadingOut(id=r["reading_id"], ts=to_iso(r["ts"]), lux=r["lux"],
-                       received_at=r["received_at"])
+                       source_id=r["source_id"], received_at=r["received_at"])
             for r in rows
         ],
     )
+
+
+# ---------- 来源优先级版本（多来源仲裁） ----------
+
+@app.put("/exhibits/{exhibit_id}/source-priorities",
+         response_model=SourcePriorityConfigOut, tags=["sources"])
+def put_source_priorities(
+    exhibit_id: str,
+    payload: SourcePriorityPut,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> SourcePriorityConfigOut:
+    """新增一个**来源优先级版本**（只增不改）。
+
+    - 版本携带 ``effective_at`` 生效时刻（含端点）：仅对该时刻及以后采样的
+      读数生效，更早的历史采样仍按旧版本仲裁；历史读数与存证收据**绝不
+      改写**，调整优先级只从生效时刻起影响查询重算；
+    - 必须携带 ``expected_version``（客户端所见当前最新版本号，从未配置为
+      0）；与服务端当前版本不一致返回 **409**，需重新读取配置后重试；
+    - ``priorities`` 为该版本的**完整**来源优先级清单（整体写入，不增量
+      合并）：``priority`` 越大越权威，同值为并列档；同版本内 source_id 不
+      得重复（422），同一生效时刻也不得重复建版本（422）；
+    - 别名访问自动解析到规范档案。
+    """
+    return put_priority_config(conn, exhibit_id, payload)
+
+
+@app.get("/exhibits/{exhibit_id}/source-priorities",
+         response_model=SourcePriorityConfigOut, tags=["sources"])
+def get_source_priorities(
+    exhibit_id: str,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> SourcePriorityConfigOut:
+    """读取来源优先级配置（全部历史版本，按生效时刻升序）；从未配置时
+    ``current_version=0``、``versions=[]``。别名自动解析到规范档案。"""
+    return load_priority_config(conn, exhibit_id)
+
+
+@app.get("/exhibits/{exhibit_id}/authoritative-timeline",
+         response_model=AuthoritativeTimelineOut, tags=["sources"])
+def get_authoritative_timeline(
+    exhibit_id: str,
+    start: datetime | None = Query(default=None, description="起始时刻（含），ISO 8601"),
+    end: datetime | None = Query(default=None, description="结束时刻（含），ISO 8601"),
+    limit: int = Query(default=1000, ge=1, le=100000),
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> AuthoritativeTimelineOut:
+    """逐采样时刻返回**多来源仲裁结果**（权威时间线）。
+
+    - ``authoritative``：按采样时刻生效的优先级版本仲裁出唯一权威照度；
+    - ``conflict``：最高优先级一档并列来源照度不一致，该时刻保持冲突，
+      **不进入剂量与诊断时间线**；``lux_span`` 给出照度跨度、
+      ``candidates`` 给出该时刻留存的全部原始读数用于核查；
+    - ``legacy``：该时刻没有任何生效优先级版本，保持旧行为（原始读数各自
+      成点；原始照度不一致时 ``lux`` 为 null）；
+    - 未列入生效版本的来源（含未标注 source_id 的旧读数）归入最低档，低于
+      任何已列来源；同一时刻同照度的并列读数合并为一个权威点，
+      ``reading_ids`` 保留全部并列读数 ID；
+    - 别名访问自动解析到规范档案。
+    """
+    start_s = ensure_aware(start).timestamp() if start is not None else None
+    end_s = ensure_aware(end).timestamp() if end is not None else None
+    if start_s is not None and end_s is not None and end_s <= start_s:
+        raise HTTPException(status_code=422, detail="end 必须晚于 start")
+    return build_timeline_out(conn, exhibit_id, start_s, end_s, limit)
 
 
 # ---------- 照度上报存证（收据链查询与整链校验） ----------
@@ -553,14 +652,20 @@ def diagnose_readings(
 ) -> DiagnoseResponse:
     """照度采集质量诊断：识别 gap / jump / stuck / timestamp_conflict 事件。
 
-    - 同时刻照度相同的多条读数先**合并**为一个时间点（读数 ID 全部保留）；
-      同时刻出现**不同照度**则产生 ``timestamp_conflict``，该时刻不落点，
-      并从两侧中断连续链；
+    - 诊断先在规范档案的**原始读数**上按采样时刻做**多来源仲裁**（与剂量
+      核算同一份来源优先级版本）：仲裁出唯一权威照度的时刻合并为时间线上
+      的一个点（并列读数 ID 全部保留）；**最高优先级并列且照度不同的仲裁
+      冲突时刻保持冲突、不进入诊断时间线**，链在其两侧中断（冲突本身请用
+      权威时间线查询核查，不作为采集质量事件重复报告）；
+    - 对没有生效优先级版本的时刻（含旧请求不带 source_id 的全部数据）保持
+      旧行为：同时刻照度相同的多条读数先**合并**为一个时间点，同时刻出现
+      **不同照度**则产生 ``timestamp_conflict``，该时刻不落点并中断连续链；
     - 对无歧义读数：相邻间隔**超过**展品 ``max_interval_seconds`` 记为
       ``gap``；间隔合规但变化速率 ``|Δlux|/Δt`` 超过
       ``max_rate_lux_per_second`` 记为 ``jump``；相邻照度差均不超过
       ``stuck_tolerance_lux`` 且首末累计时长达到 ``min_stuck_seconds`` 的
-      最大连续段记为 ``stuck``；gap、jump 与时间冲突都会截断 stuck 链；
+      最大连续段记为 ``stuck``；gap、jump、时间冲突与仲裁冲突都会截断
+      stuck 链；
     - 事件**先基于规范档案的完整时间线形成**，再筛选与查询窗口相交的结果：
       缩窄窗口只影响哪些事件被返回，**不改变任何事件的原始边界与相关读数**；
     - 结果按 (起点, 类型) 稳定排序；每个事件给出边界、相关读数 ID 以及
@@ -575,14 +680,20 @@ def diagnose_readings(
     if end_s <= start_s:
         raise HTTPException(status_code=422, detail="end 必须晚于 start")
 
-    # 完整时间线：诊断事件必须在全部已存（未作废）读数上形成，不能只取窗口内数据
+    # 完整时间线：诊断事件必须在全部已存（未作废）读数上形成，不能只取窗口内数据。
+    # 先按生效来源优先级版本仲裁，仲裁冲突时刻不进时间线；无生效版本的时刻
+    # 为 legacy，沿用同值合并 / 异值 timestamp_conflict 的旧行为。
     rows = conn.execute(
-        "SELECT reading_id, ts, lux FROM readings "
+        "SELECT reading_id, ts, lux, source_id FROM readings "
         "WHERE exhibit_id = ? AND voided_at IS NULL ORDER BY ts, reading_id",
         (canonical_id,),
     ).fetchall()
-    events = build_events(
-        [(r["reading_id"], r["ts"], r["lux"]) for r in rows],
+    groups = arbitrate(
+        [(r["reading_id"], r["ts"], r["lux"], r["source_id"]) for r in rows],
+        list_versions(conn, canonical_id),
+    )
+    events = build_events_from_groups(
+        groups,
         max_interval_s=exhibit["max_interval_seconds"],
         max_rate_lux_per_s=payload.max_rate_lux_per_second,
         stuck_tol_lux=payload.stuck_tolerance_lux,
@@ -641,7 +752,10 @@ def query_dose(
       窗口起止处读取窗口外最近相邻读数，按线性照度裁剪有效梯形段；
     - remaining_luxh / exceeded / first_exceeded_at 依据截至窗口末的
       全历史累计计算，首次越线时刻不因缩窄窗口而改变；
-    - 剂量在查询时基于全部已存读数实时重算，补传读数立即生效；
+    - 剂量在查询时基于全部已存读数按**来源优先级版本实时仲裁**后重算：
+      补传读数或调整优先级版本（仅对新版本生效时刻起的采样）立即生效；
+      最高优先级并列且照度不同的冲突时刻保持歧义、不进入积分（两侧读数
+      不跨接）；没有生效版本、或旧请求不带 source_id 时行为与旧版一致；
     - 请求 ID 若是已归并档案的别名，自动解析到规范档案；
     - ``calendar=display`` 时仅在开放区间内裁剪梯形积分：窗口内闭馆时长
       单列 closed_seconds，covered_seconds、unknown_seconds、closed_seconds
@@ -659,19 +773,27 @@ def query_dose(
     # 1) 截至 end 的全部历史读数——remaining/exceeded/first_exceeded_at 按全历史累计；
     # 2) end 之后最近一条读数——窗口末端可向其线性裁剪。
     # 窗口起点之前的历史读数本身就在 1) 中，窗口起点处同样可线性裁剪。
-    all_rows = conn.execute(
-        "SELECT ts, lux FROM readings WHERE exhibit_id = ? AND ts <= ? "
-        "AND voided_at IS NULL ORDER BY ts ASC",
-        (canonical_id, end_s),
+    # 仲裁按时刻进行，必须取全该时刻的读数集合，因此不按读数行做时间裁剪外
+    # 的额外限制（窗口裁剪在计算阶段完成）。
+    versions = list_versions(conn, canonical_id)
+    raw_rows = conn.execute(
+        "SELECT reading_id, ts, lux, source_id FROM readings "
+        "WHERE exhibit_id = ? AND voided_at IS NULL ORDER BY ts ASC",
+        (canonical_id,),
     ).fetchall()
-    after = conn.execute(
-        "SELECT ts, lux FROM readings WHERE exhibit_id = ? AND ts > ? "
-        "AND voided_at IS NULL ORDER BY ts ASC LIMIT 1",
-        (canonical_id, end_s),
-    ).fetchall()
-    readings = [(r["ts"], r["lux"]) for r in all_rows]
-    if after:
-        readings.append((after[0]["ts"], after[0]["lux"]))
+    groups = arbitrate(
+        [(r["reading_id"], r["ts"], r["lux"], r["source_id"]) for r in raw_rows],
+        versions,
+    )
+    all_points, break_ts = authoritative_points(groups)
+    # 截至窗口末的历史点（冲突时刻已不在点序列中）
+    points = [(ts, lux) for ts, lux in all_points if ts <= end_s]
+    after = [(ts, lux) for ts, lux in all_points if ts > end_s][:1]
+    readings = points + after
+
+    # 冲突时刻只关心会截断积分段的：落在窗口及历史相关范围内即可
+    # （compute_dose 按段内开区间判断，多余的冲突点不影响正确性）。
+    breaks = break_ts
 
     intervals: list[tuple[float, float]] | None = None
     if calendar == "display":
@@ -693,7 +815,18 @@ def query_dose(
         max_interval_s=exhibit["max_interval_seconds"],
         dose_limit_luxh=exhibit["dose_limit_luxh"],
         open_intervals=intervals,
+        break_ts=breaks,
     )
+    # reading_count 口径：legacy（无生效版本）时刻与旧版一致，统计原始读数
+    # 条数；仲裁权威点每个时刻计 1；仲裁冲突时刻不进时间线，计 0。
+    reading_count = 0
+    for g in groups:
+        if not (start_s <= g.ts <= end_s):
+            continue
+        if g.legacy:
+            reading_count += len(g.candidates)
+        elif g.status == "point":
+            reading_count += 1
     response = DoseResponse(
         requested_id=exhibit_id,
         canonical_id=canonical_id,
@@ -706,7 +839,7 @@ def query_dose(
         first_exceeded_at=to_iso(result.first_exceeded_at) if result.first_exceeded_at is not None else None,
         unknown_seconds=round6(result.unknown_seconds),
         covered_seconds=round6(result.covered_seconds),
-        reading_count=result.reading_count,
+        reading_count=reading_count,
     )
     if result.closed_seconds is not None:
         response.closed_seconds = round6(result.closed_seconds)
@@ -742,14 +875,19 @@ def commit_merge_endpoint(
 
     - 预演后任一档案发生写入、修改或删除 → 409，事务回滚，不产生部分变更；
     - 所有 ``conflict`` 碰撞必须逐条给出 keep_target / keep_source /
-      rename_source 裁决，未解决不得提交（422）；
+      rename_source 裁决；两边**来源优先级配置**的分歧必须逐条给出
+      keep_target / keep_source 裁决，冲突不得静默覆盖；未解决不得提交（422）；
     - 提交前分别校验来源与目标的既有存证收据链，断链或内容不符 → 409；
-    - 整个归并在单个 SQLite 事务内完成；
+    - 整个归并在单个 SQLite 事务内完成；归并后的优先级配置在目标档案按
+      裁决结果合并（历史读数与收据不改写）；
     - 重复使用同一令牌返回首次提交的原结果（``already_committed=true``）；
-    - 归并后来源 ID 成为目标 ID 的永久别名，查询与读数上报都解析到目标档案；
-      双方既有收据链原样保留（``receipt_chains``），新上报继续接入目标原链。
+    - 归并后来源 ID 成为目标 ID 的永久别名，查询、读数上报与来源优先级
+      配置都解析到目标档案；双方既有收据链原样保留（``receipt_chains``），
+      新上报继续接入目标原链。
     """
-    return commit_merge(conn, payload.token, payload.resolutions)
+    return commit_merge(
+        conn, payload.token, payload.resolutions, payload.priority_resolutions
+    )
 
 
 # ---------- SQLite 在线快照（创建 / 列表 / 下载 / 校验） ----------

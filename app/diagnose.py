@@ -1,16 +1,21 @@
 """照度采集质量诊断：在规范档案的**完整时间线**上识别采集质量事件。
 
 事件类型：
-- ``timestamp_conflict``：同一时刻存在**照度不同**的读数，该时刻有歧义，
-  不参与任何连续链并同时截断其前后侧的 stuck 链；同一时刻照度完全相同的
-  多条读数先合并为时间线上的一个点（读数 ID 全部保留）；
+- ``timestamp_conflict``：**旧行为（legacy，该时刻无生效来源优先级版本）**
+  下，同一时刻存在**照度不同**的原始读数时产生——该时刻有歧义，不参与任何
+  连续链并同时截断其前后侧的 stuck 链；同一时刻照度完全相同的多条读数先
+  合并为时间线上的一个点（读数 ID 全部保留）；
+  多来源仲裁冲突时刻（最高优先级并列且照度不同，见 ``arbitration``）**保持
+  冲突、不进入诊断时间线**：链在其两侧中断，但不产生事件（它已在权威时间线
+  查询中以 ``status=conflict`` 显式给出，不是采集质量异常）。
 - ``gap``：两个相邻无歧义读数的间隔**超过**展品 ``max_interval_seconds``
   （恰好等于不算 gap），缺测段两侧各自成链；
 - ``jump``：间隔合规（不超过 max_interval_seconds）但照度变化速率
   ``|Δlux| / Δt`` **超过**调用方给定上限（恰好等于不算 jump）；
 - ``stuck``：由相邻无歧义读数组成的**最大**连续链，链上每一对相邻读数的
   照度差都不超过卡死容差，且首末读数累计时长达到最短持续时长。
-  gap、jump、照度差超过容差的相邻对以及 timestamp_conflict 都会截断链。
+  gap、jump、照度差超过容差的相邻对、legacy 同时刻异值与仲裁冲突时刻都会
+  截断链。
 
 事件先基于完整时间线一次性形成（与查询窗口无关），再由调用方筛选与窗口
 **相交**的事件；筛选只做包含/排除，绝不裁剪事件的原始边界与相关读数 ID，
@@ -19,6 +24,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+
+from .arbitration import TimelineGroup, arbitrate
 
 # 起点相同时的类型先后（实际数据中不同类型事件一般不会共用起点，
 # 这里仅给出确定的总排序，保证输出稳定）
@@ -53,26 +60,22 @@ class _Point:
     ids: list[str]
 
 
-def build_events(
-    readings: list[tuple[str, float, float]],  # (reading_id, ts, lux)
+def build_events_from_groups(
+    groups: list[TimelineGroup],
     *,
     max_interval_s: float,
     max_rate_lux_per_s: float,
     stuck_tol_lux: float,
     min_stuck_s: float,
 ) -> list[DiagnosisEvent]:
-    """在完整时间线上构建全部质量事件（尚未按窗口筛选）。"""
-    # 按 (时刻, 读数 ID) 排序，保证同时刻读数相邻且 ID 顺序确定
-    ordered = sorted(readings, key=lambda r: (r[1], r[0]))
+    """在已仲裁的时刻分组上构建质量事件（尚未按窗口筛选）。
 
-    # ---- 按时刻分组：同值合并 / 异值记 timestamp_conflict ----
-    groups: list[tuple[float, list[tuple[str, float]]]] = []
-    for rid, ts, lux in ordered:
-        if groups and groups[-1][0] == ts:
-            groups[-1][1].append((rid, lux))
-        else:
-            groups.append((ts, [(rid, lux)]))
-
+    - legacy 时刻（无生效版本）：与旧版完全一致——同值合并为一个点，异值记
+      ``timestamp_conflict``；原始多条读数在剂量侧各自成点（同时刻零间隔），
+      诊断侧按同值合并/异值冲突处理；
+    - 仲裁权威点：并列读数同值，天然是合并后的一个点；
+    - 仲裁冲突时刻：不落点、从两侧中断连续链（不产生诊断事件）。
+    """
     events: list[DiagnosisEvent] = []
     run: list[_Point] = []
 
@@ -95,26 +98,45 @@ def build_events(
                 ))
         run.clear()
 
+    def start_after_break(point: _Point) -> None:
+        flush_stuck()
+        run.append(point)
+
     prev: _Point | None = None
-    for ts, members in groups:
-        lux_values = {lux for _, lux in members}
-        ids = [rid for rid, _ in members]
-        if len(lux_values) > 1:
-            # 同一时刻照度不一致：有歧义，截断连续链，该时刻不落点
+    for g in groups:
+        if g.is_break():
+            # 多来源仲裁冲突：保持冲突、不进诊断时间线；截断两侧链，不产生事件
             flush_stuck()
-            events.append(DiagnosisEvent(
-                type="timestamp_conflict",
-                start=ts,
-                end=ts,
-                reading_ids=ids,
-                lux_span=max(lux_values) - min(lux_values),
-            ))
             prev = None
             continue
 
-        cur = _Point(ts=ts, lux=members[0][1], ids=ids)
+        if g.legacy:
+            # 旧行为：原始读数按照度去重，同值合并、异值记 timestamp_conflict
+            members = sorted(g.candidates, key=lambda c: c.reading_id)
+            lux_values = {c.lux for c in members}
+            ids = [c.reading_id for c in members]
+            if len(lux_values) > 1:
+                flush_stuck()
+                events.append(DiagnosisEvent(
+                    type="timestamp_conflict",
+                    start=g.ts,
+                    end=g.ts,
+                    reading_ids=ids,
+                    lux_span=max(lux_values) - min(lux_values),
+                ))
+                prev = None
+                continue
+            cur = _Point(ts=g.ts, lux=members[0].lux, ids=ids)
+        else:
+            # 仲裁权威点：winners 照度相同，合并为一个点（ID 按读数 ID 排序）
+            assert g.status == "point"
+            cur = _Point(
+                ts=g.ts, lux=g.lux,  # type: ignore[arg-type]
+                ids=sorted(c.reading_id for c in g.winners),
+            )
+
         if prev is not None:
-            dt = cur.ts - prev.ts  # 分组后必为正
+            dt = cur.ts - prev.ts  # 分组后必为非负；同时刻零间隔不产生 gap/jump
             delta = abs(cur.lux - prev.lux)
             if dt > max_interval_s:
                 # 间隔超限：gap，gap 两侧各自成链（新链从 cur 起）
@@ -127,7 +149,7 @@ def build_events(
                     interval_seconds=dt,
                 ))
                 run = [cur]
-            elif delta / dt > max_rate_lux_per_s:
+            elif dt > 0 and delta / dt > max_rate_lux_per_s:
                 # 间隔合规但速率超限：jump，同样截断
                 flush_stuck()
                 events.append(DiagnosisEvent(
@@ -144,7 +166,8 @@ def build_events(
                 flush_stuck()
                 run = [cur]
             else:
-                # 相邻照度差在容差内：延续当前最大平稳链
+                # 相邻照度差在容差内（dt==0 的同时刻合并点 delta==0，同样并入）：
+                # 延续当前最大平稳链
                 run.append(cur)
         else:
             run = [cur]
@@ -152,6 +175,32 @@ def build_events(
 
     flush_stuck()
     return events
+
+
+def build_events(
+    readings: list[tuple[str, float, float]],  # (reading_id, ts, lux)
+    *,
+    max_interval_s: float,
+    max_rate_lux_per_s: float,
+    stuck_tol_lux: float,
+    min_stuck_s: float,
+) -> list[DiagnosisEvent]:
+    """旧入口：在无来源优先级配置的原始读数上构建事件。
+
+    全部读数视为未标注来源、无生效版本（legacy），与历史行为完全一致：
+    按 (时刻, 读数 ID) 排序，同时刻同值合并、异值记 timestamp_conflict。
+    """
+    groups = arbitrate(
+        [(rid, ts, lux, None) for rid, ts, lux in readings],
+        versions=[],
+    )
+    return build_events_from_groups(
+        groups,
+        max_interval_s=max_interval_s,
+        max_rate_lux_per_s=max_rate_lux_per_s,
+        stuck_tol_lux=stuck_tol_lux,
+        min_stuck_s=min_stuck_s,
+    )
 
 
 def intersect_window(

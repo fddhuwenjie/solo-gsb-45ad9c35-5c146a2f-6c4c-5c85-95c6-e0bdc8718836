@@ -55,7 +55,13 @@ def _inserted_targets(payload_json: str) -> list[dict]:
     for r in content["request"]["readings"]:
         if r["id"] in inserted_ids and r["id"] not in seen:
             seen.add(r["id"])
-            targets.append({"id": r["id"], "ts": r["ts"], "lux": r["lux"]})
+            targets.append({
+                "id": r["id"],
+                "ts": r["ts"],
+                "lux": r["lux"],
+                # 旧版收据没有 source_id 键：缺键等价于未标注来源（None）
+                "source_id": r.get("source_id"),
+            })
     return targets
 
 
@@ -163,12 +169,12 @@ def correct_receipt(
         voided: list[VoidedReadingOut] = []
         for t in targets:
             row = conn.execute(
-                "SELECT ts, lux, voided_at FROM readings "
+                "SELECT ts, lux, source_id, voided_at FROM readings "
                 "WHERE exhibit_id = ? AND reading_id = ?",
                 (canonical_id, t["id"]),
             ).fetchone()
             # 读数归属变化：已不在该档案（归并去重/删除）、内容被覆盖
-            # （归并 keep_source）或已被作废 —— 全部整次 409。
+            # （归并 keep_source，含来源标注变化）或已被作废 —— 全部整次 409。
             if row is None:
                 problems.append(
                     f"{t['id']}：读数已不在规范档案 {canonical_id} 下（读数归属已变化）"
@@ -177,10 +183,16 @@ def correct_receipt(
             if row["voided_at"] is not None:
                 problems.append(f"{t['id']}：读数已被作废")
                 continue
-            if row["ts"] != _parse_iso_epoch(t["ts"]) or row["lux"] != t["lux"]:
+            if (
+                row["ts"] != _parse_iso_epoch(t["ts"])
+                or row["lux"] != t["lux"]
+                or row["source_id"] != t["source_id"]
+            ):
                 problems.append(f"{t['id']}：读数内容与收据记录不一致（读数归属已变化）")
                 continue
-            voided.append(VoidedReadingOut(id=t["id"], ts=t["ts"], lux=t["lux"]))
+            voided.append(VoidedReadingOut(
+                id=t["id"], ts=t["ts"], lux=t["lux"], source_id=t["source_id"],
+            ))
 
         if problems:
             raise _CorrectionConflict(

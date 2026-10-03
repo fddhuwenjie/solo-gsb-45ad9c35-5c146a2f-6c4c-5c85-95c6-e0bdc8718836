@@ -311,18 +311,32 @@ def verify_snapshot(seq: int) -> SnapshotVerifyOut | None:
         expected=expected_bytes, actual=actual_bytes,
     ))
 
-    # 2) 独立只读连接：URI mode=ro + query_only，结构上不可能写任何库文件
+    # 文件被篡改到 SQLite 无法解析（如 schema 页字节损坏）时，PRAGMA 可能抛
+    # sqlite3.Error，或在把损坏的文本结果解码为 str 时抛 UnicodeDecodeError：
+    # 两者都同样是快照不通过的证据，逐项记为失败而不是让接口 500。
     uri = f"file:{quote(str(db_file.resolve()))}?mode=ro"
     conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
+    _DB_ERRORS = (sqlite3.Error, UnicodeDecodeError)
     try:
         conn.execute("PRAGMA query_only = ON")
-        actual_pages = int(conn.execute("PRAGMA page_count").fetchone()[0])
-        checks.append(_check(
-            "page_count", actual_pages == expected_pages,
-            expected=expected_pages, actual=actual_pages,
-        ))
+        try:
+            actual_pages = int(conn.execute("PRAGMA page_count").fetchone()[0])
+        except _DB_ERRORS as exc:
+            checks.append(_check(
+                "page_count", False,
+                expected=expected_pages, actual=None,
+                error=f"无法读取页数（数据库已损坏）: {exc!r}",
+            ))
+        else:
+            checks.append(_check(
+                "page_count", actual_pages == expected_pages,
+                expected=expected_pages, actual=actual_pages,
+            ))
 
-        integrity_rows = [row[0] for row in conn.execute("PRAGMA integrity_check")]
+        try:
+            integrity_rows = [row[0] for row in conn.execute("PRAGMA integrity_check")]
+        except _DB_ERRORS as exc:
+            integrity_rows = [f"integrity_check 执行失败（数据库已损坏）: {exc!r}"]
         integrity_ok = integrity_rows == ["ok"]
         checks.append(_check(
             "integrity_check", integrity_ok,
@@ -330,14 +344,22 @@ def verify_snapshot(seq: int) -> SnapshotVerifyOut | None:
         ))
 
         # PRAGMA foreign_key_check 每行：(子表, 行 rowid, 父表, 外键序号)
-        fk_rows = [tuple(row) for row in conn.execute("PRAGMA foreign_key_check")]
-        checks.append(_check(
-            "foreign_key_check", len(fk_rows) == 0,
-            violations=[
-                {"table": r[0], "rowid": r[1], "parent": r[2], "fkid": r[3]}
-                for r in fk_rows
-            ],
-        ))
+        try:
+            fk_rows = [tuple(row) for row in conn.execute("PRAGMA foreign_key_check")]
+        except _DB_ERRORS as exc:
+            checks.append(_check(
+                "foreign_key_check", False,
+                violations=[],
+                error=f"foreign_key_check 执行失败（数据库已损坏）: {exc!r}",
+            ))
+        else:
+            checks.append(_check(
+                "foreign_key_check", len(fk_rows) == 0,
+                violations=[
+                    {"table": r[0], "rowid": r[1], "parent": r[2], "fkid": r[3]}
+                    for r in fk_rows
+                ],
+            ))
     finally:
         conn.close()
 

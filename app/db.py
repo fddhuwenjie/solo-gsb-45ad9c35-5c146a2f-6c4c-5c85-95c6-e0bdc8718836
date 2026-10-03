@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS readings (
     reading_id   TEXT NOT NULL,
     ts           REAL NOT NULL,           -- 采样时刻，Unix 秒（UTC）
     lux          REAL NOT NULL CHECK (lux >= 0),
+    source_id    TEXT,                    -- 上报来源（采集器/传感器 ID）；NULL 为旧版/未标注来源读数
     received_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     voided_at    TEXT,                    -- 作废时刻（UTC ISO）；NULL 表示读数仍生效
     voided_by    TEXT,                    -- 作废它的 reading_corrections.request_key
@@ -32,6 +33,30 @@ CREATE TABLE IF NOT EXISTS readings (
 );
 
 CREATE INDEX IF NOT EXISTS idx_readings_exhibit_ts ON readings (exhibit_id, ts);
+
+-- 来源优先级版本：只增不改的规范档案配置。每个版本携带生效时刻 effective_at，
+-- 从该时刻起（含）对采样时刻生效，直到下一个版本生效。版本间互不改写；
+-- 查询权威时间线时按采样时刻选取当时生效的版本做仲裁，因此调整优先级只从
+-- 生效时刻起影响重算，历史读数与存证收据永不改写。
+-- expected_version 乐观并发：PUT 必须携带当前最新 version，不符返回 409。
+-- 档案归并时随目标档案级联（归并事务先按冲突合并结果重写，冲突不得静默覆盖）。
+CREATE TABLE IF NOT EXISTS source_priority_versions (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,  -- 即版本号，全局连续递增
+    exhibit_id   TEXT NOT NULL REFERENCES exhibits(id) ON DELETE CASCADE,
+    effective_at REAL NOT NULL,          -- 生效时刻，Unix 秒（UTC），含端点
+    created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE (exhibit_id, effective_at)
+);
+
+-- 一个版本内的来源优先级条目：priority 越大越权威；同版本内 source_id 唯一。
+CREATE TABLE IF NOT EXISTS source_priority_entries (
+    version_id INTEGER NOT NULL REFERENCES source_priority_versions(id) ON DELETE CASCADE,
+    exhibit_id TEXT NOT NULL REFERENCES exhibits(id) ON DELETE CASCADE,
+    source_id  TEXT NOT NULL,
+    priority   INTEGER NOT NULL,
+    PRIMARY KEY (version_id, source_id),
+    UNIQUE (exhibit_id, version_id, source_id)
+);
 
 -- 归并后来源 ID 成为目标（规范）ID 的永久别名；所有写入与查询先解析别名。
 -- 归并提交时会把来源名下的旧别名一并改指向目标，因此该表始终只有一跳，
@@ -53,6 +78,8 @@ CREATE TABLE IF NOT EXISTS merge_previews (
     target_meta_hash TEXT NOT NULL,
     source_read_hash TEXT NOT NULL,
     target_read_hash TEXT NOT NULL,
+    source_priority_hash TEXT NOT NULL DEFAULT '',  -- 来源来源优先级版本快照哈希
+    target_priority_hash TEXT NOT NULL DEFAULT '',  -- 目标来源优先级版本快照哈希
     conflict_count   INTEGER NOT NULL,
     created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     committed_at     TEXT,
@@ -155,10 +182,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_reading_corrections_receipt
 ON reading_corrections (chain_id, seq);
 """
 
-# 旧库（更正功能上线前创建）补列：幂等 ALTER，列已存在则跳过。
+# 旧库补列：幂等 ALTER，列已存在则跳过。
 _LEGACY_MIGRATIONS = (
     "ALTER TABLE readings ADD COLUMN voided_at TEXT",
     "ALTER TABLE readings ADD COLUMN voided_by TEXT",
+    "ALTER TABLE readings ADD COLUMN source_id TEXT",
+    "ALTER TABLE merge_previews ADD COLUMN source_priority_hash TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE merge_previews ADD COLUMN target_priority_hash TEXT NOT NULL DEFAULT ''",
 )
 
 
@@ -180,11 +210,12 @@ def connect() -> sqlite3.Connection:
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
-        existing_cols = {
-            r["name"] for r in conn.execute("PRAGMA table_info(readings)").fetchall()
-        }
         for stmt in _LEGACY_MIGRATIONS:
+            table = stmt.split("TABLE", 1)[1].strip().split()[0]
             col = stmt.split("ADD COLUMN", 1)[1].strip().split()[0]
+            existing_cols = {
+                r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
             if col not in existing_cols:
                 conn.execute(stmt)
 
